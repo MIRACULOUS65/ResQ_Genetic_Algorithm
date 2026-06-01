@@ -2,11 +2,12 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { Loader2, Clock, Truck, CheckCircle, MapPin } from 'lucide-react';
+import { Loader2, Clock, Truck, CheckCircle, MapPin, Navigation } from 'lucide-react';
 import { toast } from 'sonner';
 import { emergencyApi } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import { useSocket } from '@/hooks/useSocket';
+import { useRoute } from '@/hooks/useRoute';
 import Sidebar from '@/components/layout/Sidebar';
 import Topbar from '@/components/layout/Topbar';
 import StatusStepper from '@/components/dashboard/StatusStepper';
@@ -168,6 +169,21 @@ export default function TrackPage() {
     return [12.97, 77.59];
   }, [request?.latitude, request?.longitude]);
 
+  // ── Live road route: ambulance → patient ──────────────────────────────────
+  // Memoise the two endpoints so the routing hook only refires on real moves.
+  const patientPos = useMemo(
+    () => (request ? { lat: request.latitude, lng: request.longitude } : null),
+    [request?.latitude, request?.longitude]
+  );
+  // Only draw the route while the trip is heading TO the patient. Once picked up,
+  // the ambulance→patient leg is no longer meaningful.
+  const showRouteToPatient =
+    !!assignment && !['picked_up', 'completed', 'cancelled'].includes(assignment.status);
+  const { route } = useRoute(
+    showRouteToPatient ? ambulancePos : null,
+    showRouteToPatient ? patientPos : null
+  );
+
   // ── Early returns — only after ALL hooks ─────────────────────────────────
   if (isLoading || authLoading) {
     return (
@@ -207,6 +223,7 @@ export default function TrackPage() {
               <LiveMap
                 center={mapCenter}
                 markers={mapMarkers}
+                route={route ? { coordinates: route.coordinates } : undefined}
                 height="460px"
                 zoom={14}
               />
@@ -219,6 +236,21 @@ export default function TrackPage() {
                       <Clock size={18} />{assignment.eta} min
                     </div>
                   </div>
+
+                  {showRouteToPatient && route && (
+                    <div>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>
+                        Route Distance
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.375rem', fontWeight: 600 }}>
+                        <Navigation size={15} />
+                        {route.distanceKm.toFixed(1)} km
+                        {route.fallback && (
+                          <span style={{ fontSize: '0.65rem', color: 'var(--text-faint)' }}>(direct)</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   {assignment.ambulances?.vehicle_number && (
                     <div>

@@ -87,6 +87,8 @@ export default function LiveMap({
   // Fire fitBounds ONCE when both patient + ambulance are on the map together.
   // After that the user can zoom/pan freely without interference.
   const hasFittedBothRef = useRef(false);
+  // Same idea for the route: fit to the route once, never snap again.
+  const hasFittedRouteRef = useRef(false);
 
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasError, setHasError] = useState(false);
@@ -135,6 +137,7 @@ export default function LiveMap({
         markerMapRef.current.clear();
         activeKeysRef.current.clear();
         hasFittedBothRef.current = false;
+        hasFittedRouteRef.current = false;
         setIsLoaded(false);
       }
     };
@@ -218,32 +221,53 @@ export default function LiveMap({
   }, [markers, isLoaded]);
 
   // ─── Route polyline ────────────────────────────────────────────────────────
+  // Smart update: create the source/layers once, then only swap the GeoJSON data
+  // on subsequent route changes. fitBounds runs ONCE (first non-empty route) so
+  // the user's zoom/pan is never snapped back on live route updates.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !isLoaded) return;
 
     const SRC = 'live-route', GLOW = 'live-route-glow', LINE = 'live-route-line';
-    [GLOW, LINE].forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
-    if (map.getSource(SRC)) map.removeSource(SRC);
-    if (!route?.coordinates?.length) return;
 
-    map.addSource(SRC, {
-      type: 'geojson',
-      data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: route.coordinates } },
-    });
-    map.addLayer({ id: GLOW, type: 'line', source: SRC,
-      layout: { 'line-join': 'round', 'line-cap': 'round' },
-      paint: { 'line-color': '#EDEDED', 'line-width': 10, 'line-opacity': 0.1, 'line-blur': 6 } });
-    map.addLayer({ id: LINE, type: 'line', source: SRC,
-      layout: { 'line-join': 'round', 'line-cap': 'round' },
-      paint: { 'line-color': '#EDEDED', 'line-width': 2.5, 'line-opacity': 0.8 } });
+    // No route → tear down any existing layers/source and reset the fit flag.
+    if (!route?.coordinates?.length) {
+      [GLOW, LINE].forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
+      if (map.getSource(SRC)) map.removeSource(SRC);
+      hasFittedRouteRef.current = false;
+      return;
+    }
 
-    const lngs = route.coordinates.map(([lng]) => lng);
-    const lats = route.coordinates.map(([, lat]) => lat);
-    map.fitBounds(
-      [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
-      { padding: 60, duration: 700, maxZoom: 16 }
-    );
+    const geojson = {
+      type: 'Feature' as const,
+      properties: {},
+      geometry: { type: 'LineString' as const, coordinates: route.coordinates },
+    };
+
+    const existing = map.getSource(SRC);
+    if (existing) {
+      // Smooth update — just replace the line data, no layer churn.
+      existing.setData(geojson);
+    } else {
+      map.addSource(SRC, { type: 'geojson', data: geojson });
+      map.addLayer({ id: GLOW, type: 'line', source: SRC,
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: { 'line-color': '#EDEDED', 'line-width': 10, 'line-opacity': 0.1, 'line-blur': 6 } });
+      map.addLayer({ id: LINE, type: 'line', source: SRC,
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: { 'line-color': '#EDEDED', 'line-width': 2.5, 'line-opacity': 0.8 } });
+    }
+
+    // Fit to the full route exactly once.
+    if (!hasFittedRouteRef.current) {
+      hasFittedRouteRef.current = true;
+      const lngs = route.coordinates.map(([lng]) => lng);
+      const lats = route.coordinates.map(([, lat]) => lat);
+      map.fitBounds(
+        [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
+        { padding: 60, duration: 700, maxZoom: 16 }
+      );
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route, isLoaded]);
 

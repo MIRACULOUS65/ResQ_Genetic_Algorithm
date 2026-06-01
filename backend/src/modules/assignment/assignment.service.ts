@@ -1,166 +1,72 @@
-import axios from 'axios';
 import { supabaseAdmin } from '../../config/supabase';
-import { env } from '../../config/env';
 import {
   EmergencyRequest,
-  Ambulance,
   Assignment,
-  Priority,
-  AllocationOutput,
-  PredictionOutput,
 } from '../../types';
 import { AppError } from '../../middleware/errorHandler';
 import { getAvailableAmbulancesService, updateAmbulanceStatusService } from '../ambulance/ambulance.service';
 import { updateEmergencyStatusService } from '../emergency/emergency.service';
 import { getIo } from '../../sockets/socket';
-
-// ─── Haversine Distance ───────────────────────────────────────────────────────
-
-function haversineKm(
-  lat1: number, lon1: number,
-  lat2: number, lon2: number
-): number {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-// ─── Priority Prediction (AI-ML Service or Fallback) ─────────────────────────
-
-async function predictPriority(
-  request: EmergencyRequest
-): Promise<PredictionOutput> {
-  try {
-    const now = new Date();
-    const payload = {
-      emergency_type: request.emergency_type,
-      hour: now.getHours(),
-      day_of_week: now.getDay(),
-      traffic_level: 3, // default medium — real data from ORS in production
-      weather: 'clear',
-      latitude: request.latitude,
-      longitude: request.longitude,
-    };
-
-    const { data } = await axios.post<PredictionOutput>(
-      `${env.AI_ML_SERVICE_URL}/predict`,
-      payload,
-      { timeout: 5000 }
-    );
-    return data;
-  } catch {
-    // Fallback: rule-based priority
-    console.warn('⚠️  AI-ML service unavailable. Using rule-based fallback.');
-    const highPriorityTypes = ['cardiac_arrest', 'stroke', 'respiratory'];
-    const priority: Priority = highPriorityTypes.includes(request.emergency_type)
-      ? 'critical'
-      : 'high';
-    return { priority, confidence: 0.6 };
-  }
-}
-
-// ─── Genetic Algorithm (Inline Fallback if Python service down) ──────────────
-
-function findBestAmbulanceGA(
-  request: EmergencyRequest,
-  ambulances: Ambulance[],
-  priority: Priority
-): AllocationOutput {
-  if (ambulances.length === 0) {
-    throw new AppError('No available ambulances', 503);
-  }
-
-  // Priority weights for fitness scoring
-  const priorityMultiplier: Record<Priority, number> = {
-    critical: 2.0,
-    high: 1.5,
-    medium: 1.0,
-    low: 0.8,
-  };
-  const multiplier = priorityMultiplier[priority];
-
-  // Population: each individual is [ambulance_index, fitness_score]
-  type Individual = { idx: number; fitness: number };
-
-  const evaluate = (idx: number): Individual => {
-    const amb = ambulances[idx];
-    const distance = haversineKm(
-      request.latitude, request.longitude,
-      amb.latitude, amb.longitude
-    );
-    // Simple fitness: inverse distance weighted by priority
-    const fitness = (multiplier * 100) / (distance + 1);
-    return { idx, fitness };
-  };
-
-  // Initial population
-  let population: Individual[] = ambulances.map((_, i) => evaluate(i));
-
-  // Sort by fitness descending (selection)
-  population.sort((a, b) => b.fitness - a.fitness);
-
-  // Take top half, run a few crossover + mutation cycles
-  const GENERATIONS = 5;
-  for (let g = 0; g < GENERATIONS; g++) {
-    const top = population.slice(0, Math.ceil(population.length / 2));
-    // Crossover: swap indices between pairs and re-evaluate
-    const offspring: Individual[] = [];
-    for (let i = 0; i < top.length - 1; i += 2) {
-      offspring.push(evaluate(top[i + 1].idx)); // simple single-point crossover
-    }
-    // Mutation: random re-evaluation of one random index
-    const mutIdx = Math.floor(Math.random() * ambulances.length);
-    offspring.push(evaluate(mutIdx));
-    // Merge and select
-    population = [...top, ...offspring].sort((a, b) => b.fitness - a.fitness);
-  }
-
-  const best = population[0];
-  const bestAmbulance = ambulances[best.idx];
-  const distKm = haversineKm(
-    request.latitude, request.longitude,
-    bestAmbulance.latitude, bestAmbulance.longitude
-  );
-  // Average ambulance speed ~40 km/h in city traffic
-  const etaMinutes = Math.round((distKm / 40) * 60);
-
-  return {
-    ambulance_id: bestAmbulance.id,
-    estimated_eta: etaMinutes,
-    distance_km: Math.round(distKm * 10) / 10,
-  };
-}
+import {
+  predictPriority,
+  predictTraffic,
+  predictHotspot,
+  optimizeAmbulance,
+} from './ai.service';
 
 // ─── Full Allocation Pipeline ─────────────────────────────────────────────────
+// Orchestrates the real AI-ML microservice end to end:
+//   1. /predict-priority  → emergency severity
+//   2. /predict-traffic   → congestion multiplier (affects ETA)
+//   3. /predict-hotspot   → location risk score
+//   4. /optimize-ambulance→ Genetic Algorithm picks the best unit
+// Each step degrades gracefully to a deterministic fallback if the Python
+// service is offline, so dispatch never crashes.
 
 export const triggerAllocationService = async (
   request: EmergencyRequest
 ): Promise<Assignment> => {
   const io = getIo();
 
-  // Step 1: Predict priority
+  // Step 1: Predict priority (AI model 1)
   const { priority } = await predictPriority(request);
   await updateEmergencyStatusService(request.id, 'pending', priority);
 
   // Step 2: Get available ambulances
   const ambulances = await getAvailableAmbulancesService();
+  if (ambulances.length === 0) {
+    throw new AppError('No available ambulances', 503);
+  }
 
-  // Step 3: GA allocation
-  const allocation = findBestAmbulanceGA(request, ambulances, priority);
+  // Step 3: Context for the GA — traffic multiplier (model 3) + hotspot risk (model 2).
+  // Run concurrently; both have safe fallbacks.
+  const [traffic, hotspot] = await Promise.all([
+    predictTraffic(),
+    predictHotspot(request),
+  ]);
 
-  // Step 4: Save assignment
+  // Step 4: GA allocation (model 4 / GA engine)
+  const allocation = await optimizeAmbulance(
+    request,
+    ambulances,
+    priority,
+    hotspot.risk_score,
+    traffic.congestion_multiplier
+  );
+
+  if (!allocation.best_ambulance_id) {
+    throw new AppError('No available ambulances', 503);
+  }
+
+  const etaMinutes = Math.max(1, Math.round(allocation.estimated_eta_minutes ?? 0));
+
+  // Step 5: Save assignment
   const { data: assignment, error } = await supabaseAdmin
     .from('assignments')
     .insert({
       request_id: request.id,
-      ambulance_id: allocation.ambulance_id,
-      eta: allocation.estimated_eta,
+      ambulance_id: allocation.best_ambulance_id,
+      eta: etaMinutes,
       assigned_at: new Date().toISOString(),
       status: 'assigned',
     })
@@ -169,16 +75,23 @@ export const triggerAllocationService = async (
 
   if (error) throw new AppError(error.message, 500);
 
-  // Step 5: Update request and ambulance status
+  // Step 6: Update request and ambulance status
   await updateEmergencyStatusService(request.id, 'assigned', priority);
-  await updateAmbulanceStatusService(allocation.ambulance_id, 'busy');
+  await updateAmbulanceStatusService(allocation.best_ambulance_id, 'busy');
 
-  // Step 6: Real-time notifications
+  console.log(
+    `🧬 GA dispatch [${allocation.fallback ? 'fallback' : 'ai-ml'}] · priority=${priority} · ` +
+      `traffic=${traffic.traffic_level}(${traffic.congestion_multiplier}x) · ` +
+      `risk=${hotspot.risk_category}(${hotspot.risk_score.toFixed(2)}) · ` +
+      `eta=${etaMinutes}min · ${allocation.reason_for_assignment}`
+  );
+
+  // Step 7: Real-time notifications
   // Fetch the chosen ambulance to get driver_id
   const { data: ambRow } = await supabaseAdmin
     .from('ambulances')
     .select('driver_id')
-    .eq('id', allocation.ambulance_id)
+    .eq('id', allocation.best_ambulance_id)
     .single();
 
   // Fetch the full assignment with joins for the notification payload
@@ -191,7 +104,7 @@ export const triggerAllocationService = async (
   const notifyPayload = {
     assignment: fullAssignment || assignment,
     request: { ...request, priority },
-    eta: allocation.estimated_eta,
+    eta: etaMinutes,
   };
 
   // Notify specific driver by user ID (if ambulance has a driver linked)
@@ -208,7 +121,7 @@ export const triggerAllocationService = async (
     status: 'assigned',
     priority,
     assignment_id: assignment.id,
-    eta: allocation.estimated_eta,
+    eta: etaMinutes,
   });
 
   return assignment as Assignment;

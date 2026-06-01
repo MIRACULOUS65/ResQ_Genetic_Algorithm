@@ -10,6 +10,7 @@ import { toast } from 'sonner';
 import { assignmentApi } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import { useSocket } from '@/hooks/useSocket';
+import { useRoute } from '@/hooks/useRoute';
 import Sidebar from '@/components/layout/Sidebar';
 import Topbar from '@/components/layout/Topbar';
 import { PriorityBadge, StatusBadge } from '@/components/dashboard/PriorityBadge';
@@ -248,6 +249,23 @@ export default function DriverDashboard() {
     ? [emergencyReq.latitude, emergencyReq.longitude]
     : [12.97, 77.59];
 
+  // ── Live road route: driver → patient ─────────────────────────────────────
+  const patientPos = useMemo(
+    () =>
+      emergencyReq?.latitude && emergencyReq?.longitude
+        ? { lat: emergencyReq.latitude, lng: emergencyReq.longitude }
+        : null,
+    [emergencyReq?.latitude, emergencyReq?.longitude]
+  );
+  // Show the navigation route while heading to the patient (before pickup).
+  const showRouteToPatient =
+    !!activeAssignment &&
+    ['assigned', 'accepted', 'en_route'].includes(activeAssignment.status);
+  const { route } = useRoute(
+    showRouteToPatient ? driverPos : null,
+    showRouteToPatient ? patientPos : null
+  );
+
   // Early return AFTER all hooks
   if (authLoading || isLoading) {
     return (
@@ -275,6 +293,7 @@ export default function DriverDashboard() {
                 <LiveMap
                   center={mapCenter}
                   markers={mapMarkers}
+                  route={route ? { coordinates: route.coordinates } : undefined}
                   height="450px"
                   zoom={14}
                 />
@@ -389,6 +408,15 @@ export default function DriverDashboard() {
                       <Clock size={14} color="var(--text-muted)" />
                       <span style={{ color: 'var(--text-muted)' }}>ETA: {activeAssignment.eta} min</span>
                     </div>
+                    {showRouteToPatient && route && (
+                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.875rem' }}>
+                        <Navigation size={14} color="var(--text-muted)" />
+                        <span style={{ color: 'var(--text-muted)' }}>
+                          Route: {route.distanceKm.toFixed(1)} km to patient
+                          {route.fallback && ' (direct)'}
+                        </span>
+                      </div>
+                    )}
                     {driverPos && (
                       <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.875rem' }}>
                         <Navigation size={14} color="var(--text-muted)" />

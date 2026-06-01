@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: ai-ambulance-service
+    runtime: python
+    region: singapore          # closest to India
+    plan: starter              # free tier — upgrade to standard for prod
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: GA_POPULATION_SIZE
+        value: "50"
+      - key: GA_MAX_GENERATIONS
+        value: "100"
+      - key: RANDOM_SEED
+        value: "42"

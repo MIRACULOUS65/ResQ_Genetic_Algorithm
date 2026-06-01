@@ -78,6 +78,7 @@ export const assignmentApi = {
   getAll: () => api.get('/assignment/all'),
   getMine: () => api.get('/assignment/mine'),      // ← driver only
   accept: (id: string) => api.patch(`/assignment/${id}/accept`),
+  pickup: (id: string) => api.patch(`/assignment/${id}/pickup`),
   complete: (id: string) => api.patch(`/assignment/${id}/complete`),
 };
 

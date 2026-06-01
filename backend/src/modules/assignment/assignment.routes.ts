@@ -5,6 +5,7 @@ import {
   getAllAssignments,
   getMyAssignments,
   acceptAssignment,
+  pickupAssignment,
   completeAssignment,
 } from './assignment.controller';
 
@@ -21,6 +22,9 @@ router.get('/:id', requireAuth, getAssignmentById);
 
 // PATCH /api/assignment/:id/accept — driver accepts
 router.patch('/:id/accept', requireAuth, requireRole('driver'), acceptAssignment);
+
+// PATCH /api/assignment/:id/pickup — driver marks patient picked up
+router.patch('/:id/pickup', requireAuth, requireRole('driver'), pickupAssignment);
 
 // PATCH /api/assignment/:id/complete — driver marks complete
 router.patch('/:id/complete', requireAuth, requireRole('driver'), completeAssignment);

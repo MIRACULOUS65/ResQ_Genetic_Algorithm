@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { Loader2, Clock, Truck, CheckCircle, MapPin } from 'lucide-react';
 import { toast } from 'sonner';
@@ -38,35 +38,44 @@ export default function TrackPage() {
   const [assignment, setAssignment] = useState<AssignmentData | null>(null);
   const [ambulancePos, setAmbulancePos] = useState<{ lat: number; lng: number } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [assignmentRoomId, setAssignmentRoomId] = useState<string | null>(null);
+
+  // Once a live socket GPS update arrives, stop letting the 10-second DB poll
+  // overwrite ambulancePos with stale coordinates (which may match patient's location).
+  const hasLivePosRef = useRef(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Auth guard
+  // ── Auth guard ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!authLoading && !user) router.push('/login');
   }, [user, authLoading]);
 
-  // Load the emergency request + its assignment
+  // ── Load request + assignment ─────────────────────────────────────────────
   const loadData = useCallback(async () => {
     if (!user || !id) return;
     try {
-      // Load the request
       const reqRes = await emergencyApi.getById(id);
       if (reqRes.data.success) {
         setRequest(reqRes.data.data as EmergencyRequest);
       }
 
-      // Load the assignment via the new endpoint (request_id → assignment)
       const asnRes = await emergencyApi.getAssignment(id);
       if (asnRes.data.success && asnRes.data.data) {
         const asn = asnRes.data.data as AssignmentData;
         setAssignment(asn);
-        // Seed ambulance position from DB if available
-        if (asn.ambulances?.latitude && asn.ambulances?.longitude) {
+
+        // Seed ambulancePos from DB if the driver has already shared their location
+        // AND we haven't received a live socket update yet.
+        // The socket relay now persists the driver's real location to ambulances table,
+        // so this value reflects where the driver actually is (not just their home coords).
+        if (asn.ambulances?.latitude && asn.ambulances?.longitude && !hasLivePosRef.current) {
           setAmbulancePos({
             lat: asn.ambulances.latitude,
             lng: asn.ambulances.longitude,
           });
         }
+
+        if (asn.id) setAssignmentRoomId(asn.id);
       }
     } catch {
       // silently ignore — assignment may not exist yet
@@ -79,25 +88,27 @@ export default function TrackPage() {
     loadData();
   }, [loadData]);
 
-  // Join patient socket room so we receive status events
+  // ── Socket rooms ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (user) joinRoom('join:patient', user.id);
   }, [user, joinRoom]);
 
-  // Join assignment room once we have an assignment ID
+  // Join assignment room whenever we learn the assignment ID (from loadData or socket event).
   useEffect(() => {
-    if (assignment?.id) joinRoom('join:assignment', assignment.id);
-  }, [assignment?.id, joinRoom]);
+    if (assignmentRoomId) joinRoom('join:assignment', assignmentRoomId);
+  }, [assignmentRoomId, joinRoom]);
 
-  // Listen for real-time driver location
+  // ── Real-time: driver location ────────────────────────────────────────────
   useEffect(() => {
     const unsub = on<DriverLocationEvent>('driver:location_update', (data) => {
+      hasLivePosRef.current = true; // lock: loadData must not overwrite from now on
       setAmbulancePos({ lat: data.latitude, lng: data.longitude });
     });
     return unsub;
   }, [on]);
 
-  // Listen for status changes → update request status live
+  // ── Real-time: status changes ─────────────────────────────────────────────
+  // Exactly [on, loadData] — size never changes between renders.
   useEffect(() => {
     const unsub = on<RequestStatusEvent>('request:status_change', (data) => {
       setRequest((prev) => {
@@ -108,22 +119,56 @@ export default function TrackPage() {
           ...(data.priority ? { priority: data.priority as any } : {}),
         };
       });
-      // Also refresh assignment data to get new ETA etc.
+
+      setAssignment((prev) => {
+        if (!prev) return prev;
+        return { ...prev, status: data.status, ...(data.eta ? { eta: data.eta } : {}) };
+      });
+
+      // If we received an assignment_id we didn't know about, join that room.
+      if (data.assignment_id) setAssignmentRoomId(data.assignment_id);
+
       loadData();
-      toast.info(`Status: ${data.status.replace(/_/g, ' ')}`);
+
+      const statusLabels: Record<string, string> = {
+        assigned:  '🚑 Ambulance assigned to you',
+        accepted:  '✅ Driver accepted — heading to you',
+        en_route:  '🚨 Ambulance is en route!',
+        picked_up: '🏥 On board — heading to hospital',
+        completed: '✓ Trip completed',
+      };
+      toast.info(statusLabels[data.status] ?? `Status: ${data.status.replace(/_/g, ' ')}`, { duration: 5000 });
     });
     return unsub;
   }, [on, loadData]);
 
-  // Poll every 10s as a fallback if socket is disconnected
+  // ── Polling fallback ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!user || !id) return;
     pollRef.current = setInterval(loadData, 10_000);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [loadData]);
 
+  // ── Derived values — ALL useMemo/useMemo-like must be ABOVE early returns ─
+  // Rules of Hooks: hooks cannot appear after conditional returns.
+
+  const mapMarkers = useMemo(() => {
+    const base = request
+      ? [{ lat: request.latitude, lng: request.longitude, type: 'patient' as const, label: 'Your location' }]
+      : [];
+    const ambPin = ambulancePos
+      ? [{ lat: ambulancePos.lat, lng: ambulancePos.lng, type: 'ambulance' as const,
+           label: `Ambulance · ${assignment?.ambulances?.vehicle_number ?? 'En route'}` }]
+      : [];
+    return [...base, ...ambPin];
+  }, [request?.latitude, request?.longitude, ambulancePos, assignment?.ambulances?.vehicle_number]);
+
+  const mapCenter = useMemo<[number, number]>(() => {
+    if (request?.latitude && request?.longitude) return [request.latitude, request.longitude];
+    return [12.97, 77.59];
+  }, [request?.latitude, request?.longitude]);
+
+  // ── Early returns — only after ALL hooks ─────────────────────────────────
   if (isLoading || authLoading) {
     return (
       <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-base)' }}>
@@ -146,13 +191,6 @@ export default function TrackPage() {
     );
   }
 
-  const mapMarkers = [
-    { lat: request.latitude, lng: request.longitude, type: 'patient' as const, label: 'Your location' },
-    ...(ambulancePos
-      ? [{ lat: ambulancePos.lat, lng: ambulancePos.lng, type: 'ambulance' as const, label: `Ambulance · ${assignment?.ambulances?.vehicle_number ?? ''}` }]
-      : []),
-  ];
-
   return (
     <div>
       <Sidebar role="patient" userName={user?.name || ''} onLogout={logout} />
@@ -165,98 +203,72 @@ export default function TrackPage() {
         <div className="page-container" style={{ paddingTop: '1.5rem' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '1.5rem', alignItems: 'start' }}>
 
-            {/* Map + ETA */}
             <div>
               <LiveMap
-                center={[request.latitude, request.longitude]}
+                center={mapCenter}
                 markers={mapMarkers}
                 height="460px"
                 zoom={14}
               />
 
-              {/* Assignment Info Card */}
               {assignment ? (
-                <div
-                  className="card"
-                  style={{ marginTop: '1rem', padding: '1.25rem', display: 'flex', gap: '1.5rem', flexWrap: 'wrap', alignItems: 'center' }}
-                >
-                  {/* ETA */}
+                <div className="card" style={{ marginTop: '1rem', padding: '1.25rem', display: 'flex', gap: '1.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
                   <div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>
-                      Estimated Arrival
-                    </div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>Estimated Arrival</div>
                     <div style={{ fontSize: '1.75rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.375rem' }}>
-                      <Clock size={18} />
-                      {assignment.eta} min
+                      <Clock size={18} />{assignment.eta} min
                     </div>
                   </div>
 
-                  {/* Vehicle */}
                   {assignment.ambulances?.vehicle_number && (
                     <div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>
-                        Ambulance
-                      </div>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>Ambulance</div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.375rem', fontWeight: 600 }}>
-                        <Truck size={16} />
-                        {assignment.ambulances.vehicle_number}
+                        <Truck size={16} />{assignment.ambulances.vehicle_number}
                       </div>
                     </div>
                   )}
 
-                  {/* Priority */}
                   <div>
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>Priority</div>
                     <PriorityBadge priority={request.priority} />
                   </div>
 
-                  {/* Assignment status */}
                   <div>
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>Driver Status</div>
                     <StatusBadge status={assignment.status as any} />
                   </div>
                 </div>
               ) : (
-                /* No assignment yet — AI is processing */
-                <div
-                  className="card card-padding"
-                  style={{ marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.875rem', color: 'var(--text-secondary)' }}
-                >
+                <div className="card card-padding" style={{ marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
                   <Loader2 size={16} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
                   AI + Genetic Algorithm is selecting the nearest ambulance...
                 </div>
               )}
-            </div>
 
-            {/* Status Stepper */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              <StatusStepper currentStatus={request.status} />
-
-              {/* Live confirmation when assigned */}
-              {assignment && request.status !== 'pending' && (
-                <div
-                  className="card card-padding animate-slide-up"
-                  style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem' }}
-                >
+              {ambulancePos && assignment && request.status !== 'pending' && (
+                <div className="card card-padding animate-slide-up" style={{ marginTop: '0.875rem', display: 'flex', alignItems: 'flex-start', gap: '0.75rem' }}>
                   <CheckCircle size={18} style={{ flexShrink: 0, marginTop: 2 }} />
                   <div>
                     <div style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.25rem' }}>
-                      Ambulance dispatched
+                      {request.status === 'picked_up' ? 'You are on board' : 'Ambulance dispatched'}
                     </div>
                     <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
                       {assignment.ambulances?.vehicle_number
-                        ? `${assignment.ambulances.vehicle_number} is en route to you.`
+                        ? `${assignment.ambulances.vehicle_number} · ${request.status === 'picked_up' ? 'heading to hospital' : 'en route to you'}`
                         : 'An ambulance is on its way.'}
                     </div>
-                    {ambulancePos && (
-                      <div style={{ fontSize: '0.8125rem', color: 'var(--text-faint)', marginTop: '0.25rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-                        <MapPin size={11} />
-                        Live GPS: {ambulancePos.lat.toFixed(4)}, {ambulancePos.lng.toFixed(4)}
-                      </div>
-                    )}
+                    <div style={{ fontSize: '0.8125rem', color: 'var(--text-faint)', marginTop: '0.25rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                      <MapPin size={11} />
+                      Live GPS: {ambulancePos.lat.toFixed(4)}, {ambulancePos.lng.toFixed(4)}
+                    </div>
                   </div>
                 </div>
               )}
+            </div>
+
+            <div>
+              <StatusStepper currentStatus={request.status} />
             </div>
           </div>
         </div>

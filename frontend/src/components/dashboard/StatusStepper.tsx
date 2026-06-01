@@ -52,8 +52,8 @@ export default function StatusStepper({ currentStatus }: StatusStepperProps) {
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
         {steps.map((step, idx) => {
           const stepOrder = idx;
-          const isDone = currentOrder > stepOrder;
-          const isActive = currentOrder === stepOrder;
+          const isDone = currentOrder >= stepOrder;   // current step IS done — fill it
+          const isActive = currentOrder === stepOrder; // additionally highlight current step
           const isFuture = currentOrder < stepOrder;
           const Icon = step.icon;
 
@@ -69,24 +69,17 @@ export default function StatusStepper({ currentStatus }: StatusStepperProps) {
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    background: isDone
-                      ? 'var(--text-primary)'
-                      : isActive
-                      ? 'var(--bg-elevated)'
-                      : 'var(--bg-deep)',
-                    border: `1px solid ${
-                      isDone
-                        ? 'var(--text-primary)'
-                        : isActive
-                        ? 'var(--border-strong)'
-                        : 'var(--border)'
-                    }`,
+                    background: isDone ? 'var(--text-primary)' : 'var(--bg-deep)',
+                    border: `1px solid ${isDone ? 'var(--text-primary)' : 'var(--border)'}`,
+                    boxShadow: isActive
+                      ? '0 0 0 3px var(--bg-base), 0 0 0 5px var(--text-primary)'
+                      : 'none',
                     flexShrink: 0,
                   }}
                 >
                   <Icon
                     size={14}
-                    color={isDone ? 'var(--bg-base)' : isActive ? 'var(--text-primary)' : 'var(--text-faint)'}
+                    color={isDone ? 'var(--bg-base)' : 'var(--text-faint)'}
                   />
                 </div>
                 {idx < steps.length - 1 && (
@@ -106,11 +99,11 @@ export default function StatusStepper({ currentStatus }: StatusStepperProps) {
                 <div
                   style={{
                     fontSize: '0.875rem',
-                    fontWeight: isActive ? 600 : 400,
-                    color: isDone
-                      ? 'var(--text-secondary)'
-                      : isActive
+                    fontWeight: isActive ? 700 : isDone ? 400 : 400,
+                    color: isActive
                       ? 'var(--text-primary)'
+                      : isDone
+                      ? 'var(--text-secondary)'
                       : 'var(--text-faint)',
                   }}
                 >

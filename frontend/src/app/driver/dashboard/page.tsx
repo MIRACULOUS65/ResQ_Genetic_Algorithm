@@ -1,10 +1,13 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { Loader2, Truck, MapPin, CheckCircle, Clock, AlertTriangle, RefreshCw } from 'lucide-react';
+import {
+  Loader2, Truck, MapPin, CheckCircle, Clock,
+  RefreshCw, Navigation, User, AlertTriangle, Package,
+} from 'lucide-react';
 import { toast } from 'sonner';
-import { assignmentApi, ambulanceApi } from '@/lib/api';
+import { assignmentApi } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import { useSocket } from '@/hooks/useSocket';
 import Sidebar from '@/components/layout/Sidebar';
@@ -18,12 +21,26 @@ const LiveMap = dynamic(() => import('@/components/maps/LiveMap'), { ssr: false 
 export default function DriverDashboard() {
   const router = useRouter();
   const { user, isLoading: authLoading, logout } = useAuth();
-  const { joinRoom, on, emit } = useSocket();
+  const { joinRoom, on, emit, isConnected } = useSocket();
+
   const [activeAssignment, setActiveAssignment] = useState<Assignment | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isAccepting, setIsAccepting] = useState(false);
+  const [isPickingUp, setIsPickingUp] = useState(false);
   const [isCompleting, setIsCompleting] = useState(false);
+
+  // Driver's own live location
+  const [driverPos, setDriverPos] = useState<{ lat: number; lng: number } | null>(null);
+
+  // Manual location input
+  const [manualLat, setManualLat] = useState('');
+  const [manualLng, setManualLng] = useState('');
+  const [showManualInput, setShowManualInput] = useState(false);
+
   const locationWatchRef = useRef<number | null>(null);
+  // Once the driver submits a manual location, we stop the GPS watcher entirely
+  // so it can never fire and snap the marker back to the device's real GPS coords.
+  const manualOverrideRef = useRef(false);
 
   // Auth guard
   useEffect(() => {
@@ -31,37 +48,43 @@ export default function DriverDashboard() {
     if (user && user.role !== 'driver') router.push(`/${user.role}/dashboard`);
   }, [user, authLoading]);
 
-  // Join socket room using USER ID (not ambulance ID)
+  // Join socket rooms
   useEffect(() => {
     if (!user) return;
     joinRoom('join:driver', user.id);
   }, [user, joinRoom]);
 
-  // Load driver's current assignment via /mine
-  const loadAssignment = async () => {
+  // Join assignment room whenever we have an assignment
+  useEffect(() => {
+    if (activeAssignment?.id) {
+      joinRoom('join:assignment', activeAssignment.id);
+    }
+  }, [activeAssignment?.id, joinRoom]);
+
+  // Load driver's current assignment
+  const loadAssignment = useCallback(async () => {
     if (!user) return;
     try {
       const res = await assignmentApi.getMine();
       if (res.data.success) {
         const assignments = res.data.data as Assignment[];
-        // Pick the first active assignment
         const active = assignments.find(
           (a) => !['completed', 'cancelled'].includes(a.status)
         ) || null;
         setActiveAssignment(active);
       }
     } catch {
-      // No assignments yet — that's fine
+      // no assignments yet
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [user]);
 
   useEffect(() => {
     if (user) loadAssignment();
-  }, [user]);
+  }, [user, loadAssignment]);
 
-  // Listen for new assignments via socket (fires for all drivers room)
+  // Listen for new assignment via socket
   useEffect(() => {
     const unsub = on<{ assignment: Assignment; request: any; eta: number }>(
       'assignment:new',
@@ -73,7 +96,21 @@ export default function DriverDashboard() {
     return unsub;
   }, [on]);
 
-  // GPS tracking when assignment is active
+  // Listen for status changes (e.g. en_route auto-advance from backend)
+  useEffect(() => {
+    const unsub = on<{ status: string; assignment_id: string }>(
+      'request:status_change',
+      (data) => {
+        setActiveAssignment((prev) => {
+          if (!prev || prev.id !== data.assignment_id) return prev;
+          return { ...prev, status: data.status as any };
+        });
+      }
+    );
+    return unsub;
+  }, [on]);
+
+  // GPS auto-tracking when assignment is active
   useEffect(() => {
     if (!activeAssignment || ['completed', 'cancelled'].includes(activeAssignment.status)) {
       if (locationWatchRef.current !== null) {
@@ -86,19 +123,17 @@ export default function DriverDashboard() {
     if (navigator.geolocation && locationWatchRef.current === null) {
       locationWatchRef.current = navigator.geolocation.watchPosition(
         (pos) => {
+          // Skip if the driver has switched to manual mode — don't override their input.
+          if (manualOverrideRef.current) return;
+          const { latitude, longitude } = pos.coords;
+          setDriverPos({ lat: latitude, lng: longitude });
           emit('driver:location_update', {
             assignment_id: activeAssignment.id,
-            latitude: pos.coords.latitude,
-            longitude: pos.coords.longitude,
+            latitude,
+            longitude,
           });
-          // Also update via REST for persistence
-          ambulanceApi.updateLocation({
-            latitude: pos.coords.latitude,
-            longitude: pos.coords.longitude,
-            assignment_id: activeAssignment.id,
-          }).catch(() => {});
         },
-        () => {},
+        () => {}, // silently ignore GPS errors — user can use manual input
         { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
       );
     }
@@ -110,6 +145,8 @@ export default function DriverDashboard() {
       }
     };
   }, [activeAssignment?.id]);
+
+  // ── Action handlers ────────────────────────────────────────────────────────
 
   const handleAccept = async () => {
     if (!activeAssignment) return;
@@ -127,6 +164,22 @@ export default function DriverDashboard() {
     }
   };
 
+  const handlePickup = async () => {
+    if (!activeAssignment) return;
+    setIsPickingUp(true);
+    try {
+      const res = await assignmentApi.pickup(activeAssignment.id);
+      if (res.data.success) {
+        setActiveAssignment((prev) => prev ? { ...prev, status: 'picked_up' } : null);
+        toast.success('Patient picked up! Head to hospital.');
+      }
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setIsPickingUp(false);
+    }
+  };
+
   const handleComplete = async () => {
     if (!activeAssignment) return;
     setIsCompleting(true);
@@ -134,6 +187,7 @@ export default function DriverDashboard() {
       const res = await assignmentApi.complete(activeAssignment.id);
       if (res.data.success) {
         setActiveAssignment(null);
+        setDriverPos(null);
         toast.success('Trip completed! Great work.');
       }
     } catch (err: any) {
@@ -143,6 +197,58 @@ export default function DriverDashboard() {
     }
   };
 
+  // Manual location submit
+  const handleManualLocation = () => {
+    const lat = parseFloat(manualLat);
+    const lng = parseFloat(manualLng);
+    if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      toast.error('Invalid coordinates. Lat: -90 to 90, Lng: -180 to 180.');
+      return;
+    }
+
+    // Lock out GPS: stop the watcher immediately so it cannot override this position.
+    manualOverrideRef.current = true;
+    if (locationWatchRef.current !== null) {
+      navigator.geolocation.clearWatch(locationWatchRef.current);
+      locationWatchRef.current = null;
+    }
+
+    setDriverPos({ lat, lng });
+    if (activeAssignment) {
+      emit('driver:location_update', {
+        assignment_id: activeAssignment.id,
+        latitude: lat,
+        longitude: lng,
+      });
+    }
+    toast.success('Location updated!');
+    setShowManualInput(false);
+  };
+
+  // ── Derived render values ──────────────────────────────────────────────────
+  // These MUST be above any early return (Rules of Hooks: useMemo counts as a hook).
+  const emergencyReq = activeAssignment?.emergency_requests as any;
+
+  // Memoized markers — only rebuilds when actual coordinates change.
+  // Keeps the LiveMap marker reference stable across unrelated re-renders.
+  const mapMarkers = useMemo(() => {
+    const result: { lat: number; lng: number; type: 'patient' | 'ambulance'; label: string }[] = [];
+    if (emergencyReq?.latitude && emergencyReq?.longitude) {
+      result.push({ lat: emergencyReq.latitude, lng: emergencyReq.longitude, type: 'patient', label: 'Patient location' });
+    }
+    if (driverPos) {
+      result.push({ lat: driverPos.lat, lng: driverPos.lng, type: 'ambulance', label: 'Your location' });
+    }
+    return result;
+  }, [emergencyReq?.latitude, emergencyReq?.longitude, driverPos]);
+
+  const mapCenter: [number, number] = driverPos
+    ? [driverPos.lat, driverPos.lng]
+    : emergencyReq?.latitude
+    ? [emergencyReq.latitude, emergencyReq.longitude]
+    : [12.97, 77.59];
+
+  // Early return AFTER all hooks
   if (authLoading || isLoading) {
     return (
       <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-base)' }}>
@@ -151,35 +257,102 @@ export default function DriverDashboard() {
     );
   }
 
-  const emergencyReq = activeAssignment?.emergency_requests as any;
-
   return (
     <div>
       <Sidebar role="driver" userName={user?.name || 'Driver'} onLogout={logout} />
       <div className="main-content">
-        <Topbar title="Driver Dashboard" subtitle="Your active assignment" />
+        <Topbar
+          title="Driver Dashboard"
+          subtitle={isConnected ? '🟢 Connected' : '🔴 Reconnecting...'}
+        />
 
         <div className="page-container" style={{ paddingTop: '1.5rem' }}>
           {activeAssignment && emergencyReq ? (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '1.5rem', alignItems: 'start' }}>
-              {/* Map */}
+
+              {/* ── Map ─────────────────────────────────────────── */}
               <div>
                 <LiveMap
-                  center={[emergencyReq.latitude ?? 12.97, emergencyReq.longitude ?? 77.59]}
-                  markers={[
-                    {
-                      lat: emergencyReq.latitude,
-                      lng: emergencyReq.longitude,
-                      type: 'patient',
-                      label: 'Patient location',
-                    },
-                  ]}
+                  center={mapCenter}
+                  markers={mapMarkers}
                   height="450px"
                   zoom={14}
                 />
+
+                {/* Manual location panel */}
+                <div className="card" style={{ marginTop: '0.875rem', padding: '1rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: showManualInput ? '0.875rem' : 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
+                      <Navigation size={14} />
+                      {driverPos
+                        ? `Your GPS: ${driverPos.lat.toFixed(4)}, ${driverPos.lng.toFixed(4)}`
+                        : 'GPS not available — set location manually'}
+                    </div>
+                    <button
+                      className="btn btn-secondary"
+                      style={{ padding: '0.3rem 0.75rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.375rem' }}
+                      onClick={() => setShowManualInput((v) => !v)}
+                      id="toggle-manual-location"
+                    >
+                      <MapPin size={12} />
+                      {showManualInput ? 'Cancel' : 'Set Location'}
+                    </button>
+                  </div>
+
+                  {showManualInput && (
+                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                      <div style={{ flex: 1, minWidth: '120px' }}>
+                        <label style={{ display: 'block', fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: '0.25rem', fontFamily: 'monospace' }}>
+                          LATITUDE
+                        </label>
+                        <input
+                          type="number"
+                          step="0.0001"
+                          placeholder="e.g. 12.9716"
+                          value={manualLat}
+                          onChange={(e) => setManualLat(e.target.value)}
+                          style={{
+                            width: '100%', background: 'var(--bg-base)',
+                            border: '1px solid var(--border)', borderRadius: '6px',
+                            padding: '0.5rem 0.75rem', color: 'var(--text-primary)',
+                            fontSize: '0.875rem', fontFamily: 'monospace',
+                          }}
+                          id="manual-lat"
+                        />
+                      </div>
+                      <div style={{ flex: 1, minWidth: '120px' }}>
+                        <label style={{ display: 'block', fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: '0.25rem', fontFamily: 'monospace' }}>
+                          LONGITUDE
+                        </label>
+                        <input
+                          type="number"
+                          step="0.0001"
+                          placeholder="e.g. 77.5946"
+                          value={manualLng}
+                          onChange={(e) => setManualLng(e.target.value)}
+                          style={{
+                            width: '100%', background: 'var(--bg-base)',
+                            border: '1px solid var(--border)', borderRadius: '6px',
+                            padding: '0.5rem 0.75rem', color: 'var(--text-primary)',
+                            fontSize: '0.875rem', fontFamily: 'monospace',
+                          }}
+                          id="manual-lng"
+                        />
+                      </div>
+                      <button
+                        className="btn btn-primary"
+                        style={{ padding: '0.5rem 1rem', fontSize: '0.875rem', whiteSpace: 'nowrap' }}
+                        onClick={handleManualLocation}
+                        id="submit-manual-location"
+                      >
+                        Update
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
 
-              {/* Task Card */}
+              {/* ── Task Card ────────────────────────────────────── */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <div className="card card-padding animate-slide-up">
                   <div style={{ marginBottom: '1.25rem' }}>
@@ -188,7 +361,9 @@ export default function DriverDashboard() {
                       <PriorityBadge priority={emergencyReq.priority} />
                     </div>
                     <h2 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.375rem' }}>
-                      {emergencyReq.emergency_type?.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())}
+                      {emergencyReq.emergency_type
+                        ?.replace(/_/g, ' ')
+                        .replace(/\b\w/g, (c: string) => c.toUpperCase())}
                     </h2>
                     <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
                       {emergencyReq.description}
@@ -199,8 +374,14 @@ export default function DriverDashboard() {
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.625rem', marginBottom: '1.5rem' }}>
                     <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.875rem' }}>
-                      <MapPin size={14} color="var(--text-muted)" />
+                      <User size={14} color="var(--text-muted)" />
                       <span style={{ color: 'var(--text-muted)' }}>
+                        Patient coordinates:
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.875rem' }}>
+                      <MapPin size={14} color="var(--text-muted)" />
+                      <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: '0.8125rem' }}>
                         {emergencyReq.latitude?.toFixed(4)}, {emergencyReq.longitude?.toFixed(4)}
                       </span>
                     </div>
@@ -208,9 +389,19 @@ export default function DriverDashboard() {
                       <Clock size={14} color="var(--text-muted)" />
                       <span style={{ color: 'var(--text-muted)' }}>ETA: {activeAssignment.eta} min</span>
                     </div>
+                    {driverPos && (
+                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.875rem' }}>
+                        <Navigation size={14} color="var(--text-muted)" />
+                        <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: '0.8125rem' }}>
+                          You: {driverPos.lat.toFixed(4)}, {driverPos.lng.toFixed(4)}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
-                  {/* Action buttons */}
+                  {/* ── Action buttons — sequential flow ── */}
+
+                  {/* Step 1: Accept */}
                   {activeAssignment.status === 'assigned' && (
                     <button
                       className="btn btn-primary"
@@ -226,20 +417,88 @@ export default function DriverDashboard() {
                     </button>
                   )}
 
-                  {['accepted', 'en_route', 'picked_up'].includes(activeAssignment.status) && (
-                    <button
-                      className="btn btn-secondary"
-                      style={{ width: '100%' }}
-                      onClick={handleComplete}
-                      disabled={isCompleting}
-                      id="complete-trip"
-                    >
-                      {isCompleting
-                        ? <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
-                        : <CheckCircle size={14} />}
-                      {isCompleting ? 'Completing...' : 'Mark Trip Completed'}
-                    </button>
+                  {/* Step 2: En route / accepted — heading to patient */}
+                  {['accepted', 'en_route'].includes(activeAssignment.status) && (
+                    <>
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: '0.625rem',
+                        padding: '0.75rem', borderRadius: '6px',
+                        background: 'var(--bg-surface)', border: '1px solid var(--border)',
+                        marginBottom: '0.75rem', fontSize: '0.8125rem', color: 'var(--text-secondary)',
+                      }}>
+                        <Navigation size={14} style={{ flexShrink: 0 }} />
+                        {activeAssignment.status === 'accepted'
+                          ? 'Accepted — en route status updates in 10s...'
+                          : '🚨 En route to patient — pick them up when you arrive'}
+                      </div>
+                      <button
+                        className="btn btn-primary"
+                        style={{ width: '100%' }}
+                        onClick={handlePickup}
+                        disabled={isPickingUp}
+                        id="pickup-patient"
+                      >
+                        {isPickingUp
+                          ? <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                          : <Package size={14} />}
+                        {isPickingUp ? 'Marking...' : 'Patient Picked Up'}
+                      </button>
+                    </>
                   )}
+
+                  {/* Step 3: Patient picked up — heading to hospital */}
+                  {activeAssignment.status === 'picked_up' && (
+                    <>
+                      <div style={{
+                        display: 'flex', alignItems: 'center', gap: '0.625rem',
+                        padding: '0.75rem', borderRadius: '6px',
+                        background: 'var(--bg-surface)', border: '1px solid var(--border)',
+                        marginBottom: '0.75rem', fontSize: '0.8125rem', color: 'var(--text-secondary)',
+                      }}>
+                        <CheckCircle size={14} style={{ flexShrink: 0 }} />
+                        Patient is aboard — drive to the hospital
+                      </div>
+                      <button
+                        className="btn btn-secondary"
+                        style={{ width: '100%' }}
+                        onClick={handleComplete}
+                        disabled={isCompleting}
+                        id="complete-trip"
+                      >
+                        {isCompleting
+                          ? <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                          : <CheckCircle size={14} />}
+                        {isCompleting ? 'Completing...' : 'Mark Trip Completed'}
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {/* Status hint card */}
+                <div className="card" style={{ padding: '0.875rem 1rem', fontSize: '0.8rem', color: 'var(--text-faint)' }}>
+                  <div style={{ fontWeight: 600, marginBottom: '0.5rem', fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                    Trip Flow
+                  </div>
+                  {[
+                    { s: 'assigned', label: 'Assigned — Accept' },
+                    { s: 'accepted', label: 'Accepted — Drive to patient' },
+                    { s: 'en_route', label: 'En Route — Pick up patient' },
+                    { s: 'picked_up', label: 'Picked Up — Drive to hospital' },
+                    { s: 'completed', label: 'Completed ✓' },
+                  ].map(({ s, label }) => (
+                    <div key={s} style={{
+                      display: 'flex', alignItems: 'center', gap: '0.5rem',
+                      padding: '0.3rem 0',
+                      color: activeAssignment.status === s ? 'var(--text-primary)' : 'var(--text-faint)',
+                      fontWeight: activeAssignment.status === s ? 600 : 400,
+                    }}>
+                      <span style={{
+                        width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+                        background: activeAssignment.status === s ? 'var(--text-primary)' : 'var(--border)',
+                      }} />
+                      {label}
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
@@ -254,7 +513,6 @@ export default function DriverDashboard() {
               </div>
               <div style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginBottom: '1.5rem' }}>
                 You will be notified automatically when a new emergency is dispatched.
-                Use the button below to check for pending assignments.
               </div>
               <button
                 className="btn btn-secondary"

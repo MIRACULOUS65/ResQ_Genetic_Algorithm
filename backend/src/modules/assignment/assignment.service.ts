@@ -294,6 +294,104 @@ export const acceptAssignmentService = async (
   // Also update the emergency request status
   await updateEmergencyStatusService((data as any).request_id, 'accepted');
 
+  // Fetch request so we can notify the patient by their patient room
+  const { data: reqRow } = await supabaseAdmin
+    .from('emergency_requests')
+    .select('patient_id')
+    .eq('id', (data as any).request_id)
+    .single();
+
+  if (reqRow?.patient_id) {
+    const io = getIo();
+    io.to(`patient:${reqRow.patient_id}`).emit('request:status_change', {
+      request_id: (data as any).request_id,
+      status: 'accepted',
+      assignment_id: id,
+    });
+  }
+
+  return data as unknown as Assignment;
+};
+
+/**
+ * Auto-advance assignment from accepted → en_route.
+ * Called by setTimeout 10 seconds after driver accepts.
+ * Uses top-level imports (no dynamic import) so it always works in CJS.
+ */
+export const enRouteAssignmentService = async (id: string): Promise<void> => {
+  const io = getIo();
+
+  const { data: asnRow } = await supabaseAdmin
+    .from('assignments')
+    .select('request_id, status')
+    .eq('id', id)
+    .single();
+
+  // Only advance if driver hasn't already moved to a later status
+  if (!asnRow || asnRow.status !== 'accepted') return;
+
+  await supabaseAdmin
+    .from('assignments')
+    .update({ status: 'en_route' })
+    .eq('id', id);
+
+  await updateEmergencyStatusService(asnRow.request_id, 'en_route');
+
+  const { data: reqRow } = await supabaseAdmin
+    .from('emergency_requests')
+    .select('patient_id')
+    .eq('id', asnRow.request_id)
+    .single();
+
+  const payload = {
+    request_id: asnRow.request_id,
+    status: 'en_route',
+    assignment_id: id,
+  };
+
+  io.to(`assignment:${id}`).emit('request:status_change', payload);
+  if (reqRow?.patient_id) {
+    io.to(`patient:${reqRow.patient_id}`).emit('request:status_change', payload);
+  }
+
+  console.log(`✅ auto en_route fired for assignment ${id}`);
+};
+
+export const pickupAssignmentService = async (
+  id: string
+): Promise<Assignment> => {
+  const { data, error } = await supabaseAdmin
+    .from('assignments')
+    .update({ status: 'picked_up' })
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw new AppError(error.message, 500);
+
+  await updateEmergencyStatusService((data as any).request_id, 'picked_up');
+
+  // Notify patient
+  const { data: reqRow } = await supabaseAdmin
+    .from('emergency_requests')
+    .select('patient_id')
+    .eq('id', (data as any).request_id)
+    .single();
+
+  const io = getIo();
+  io.to(`assignment:${id}`).emit('request:status_change', {
+    request_id: (data as any).request_id,
+    status: 'picked_up',
+    assignment_id: id,
+  });
+  if (reqRow?.patient_id) {
+    io.to(`patient:${reqRow.patient_id}`).emit('request:status_change', {
+      request_id: (data as any).request_id,
+      status: 'picked_up',
+      assignment_id: id,
+    });
+  }
+
   return data as unknown as Assignment;
 };
 

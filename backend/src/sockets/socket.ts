@@ -1,5 +1,6 @@
 import { Server, Socket } from 'socket.io';
 import { Server as HttpServer } from 'http';
+import { supabaseAdmin } from '../config/supabase';
 
 let io: Server;
 
@@ -46,13 +47,38 @@ export const initSocket = (httpServer: HttpServer): Server => {
     // Drivers can also emit location directly via socket (in addition to REST)
     socket.on(
       'driver:location_update',
-      (data: { assignment_id: string; latitude: number; longitude: number }) => {
+      async (data: { assignment_id: string; latitude: number; longitude: number }) => {
+        // Relay to room subscribers immediately (don't await DB)
         io.to(`assignment:${data.assignment_id}`).emit('driver:location_update', {
           ...data,
           timestamp: new Date().toISOString(),
         });
-        // Also notify admin room
         io.to('admin').emit('driver:location_update', data);
+
+        // Persist to ambulances table so patients who load the page AFTER the driver
+        // shared their location can still see it via loadData (socket events are ephemeral).
+        if (data.assignment_id && data.latitude && data.longitude) {
+          try {
+            const { data: asnRow } = await supabaseAdmin
+              .from('assignments')
+              .select('ambulance_id')
+              .eq('id', data.assignment_id)
+              .single();
+
+            if (asnRow?.ambulance_id) {
+              await supabaseAdmin
+                .from('ambulances')
+                .update({
+                  latitude: data.latitude,
+                  longitude: data.longitude,
+                  last_updated: new Date().toISOString(),
+                })
+                .eq('id', asnRow.ambulance_id);
+            }
+          } catch {
+            // Non-critical — relay already succeeded above
+          }
+        }
       }
     );
 

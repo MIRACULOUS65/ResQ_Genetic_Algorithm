@@ -10,16 +10,62 @@ interface Marker {
 }
 
 interface Route {
-  coordinates: [number, number][]; // [lng, lat] pairs from ORS
+  coordinates: [number, number][]; // [lng, lat] pairs
 }
 
 interface LiveMapProps {
-  center: [number, number]; // [lat, lng]
-  zoom?: number;
+  center: [number, number]; // [lat, lng] — only used for initial map creation
+  zoom?: number;            // only used for initial map creation
   markers?: Marker[];
   route?: Route;
   height?: string;
 }
+
+function buildStyle() {
+  return {
+    version: 8 as const,
+    sources: {
+      carto: {
+        type: 'raster' as const,
+        tiles: [
+          'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+          'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+          'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '© <a href="https://carto.com/">CARTO</a> © <a href="https://www.openstreetmap.org/copyright">OSM</a>',
+      },
+    },
+    layers: [{ id: 'carto-dark', type: 'raster' as const, source: 'carto' }],
+  };
+}
+
+function createMarkerEl(type: Marker['type']): HTMLElement {
+  const el = document.createElement('div');
+  el.style.cursor = 'pointer';
+  el.style.transition = 'transform 0.2s ease';
+  el.style.filter = 'drop-shadow(0 3px 10px rgba(0,0,0,0.95))';
+  el.addEventListener('mouseenter', () => { el.style.transform = 'scale(1.18)'; });
+  el.addEventListener('mouseleave', () => { el.style.transform = 'scale(1)'; });
+
+  const cfg: Record<Marker['type'], { emoji: string; bg: string; border: string; size: number }> = {
+    patient:   { emoji: '🚨', bg: '#EDEDED', border: '#050505', size: 40 },
+    ambulance: { emoji: '🚑', bg: '#111111', border: '#EDEDED', size: 44 },
+    hospital:  { emoji: '🏥', bg: '#0A0A0A', border: '#7A7A7A', size: 36 },
+  };
+  const { emoji, bg, border, size } = cfg[type];
+  el.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+      <circle cx="${size/2}" cy="${size/2}" r="${size/2-2}" fill="${bg}" stroke="${border}" stroke-width="2.5"/>
+      <text x="${size/2}" y="${size/2+6}" text-anchor="middle" font-size="${Math.round(size*0.44)}">${emoji}</text>
+    </svg>`;
+  return el;
+}
+
+// Key by type only — one of each at most, so position updates reuse the
+// same MapLibre Marker instance via setLngLat() (smooth, no flicker).
+const markerKey = (m: Marker) => m.type;
 
 export default function LiveMap({
   center,
@@ -28,160 +74,239 @@ export default function LiveMap({
   route,
   height = '400px',
 }: LiveMapProps) {
-  const uid = useId().replace(/:/g, '-'); // unique per instance, safe as HTML id
-  const mapRef = useRef<HTMLDivElement>(null);
-  const mapInstanceRef = useRef<any>(null);
-  const markersRef = useRef<any[]>([]);
-  const routeLayerRef = useRef<any>(null);
-  const [isLoaded, setIsLoaded] = useState(false);
+  const uid = useId().replace(/:/g, '-');
+  const containerRef = useRef<HTMLDivElement>(null);
 
+  const mapRef    = useRef<any>(null);
+  const mlRef     = useRef<typeof import('maplibre-gl') | null>(null);
+
+  // type → MapLibre Marker instance
+  const markerMapRef  = useRef<Map<string, any>>(new Map());
+  const activeKeysRef = useRef<Set<string>>(new Set());
+
+  // Fire fitBounds ONCE when both patient + ambulance are on the map together.
+  // After that the user can zoom/pan freely without interference.
+  const hasFittedBothRef = useRef(false);
+
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [hasError, setHasError] = useState(false);
+
+  // ─── Init map (runs once) ─────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
 
-    const initMap = async () => {
-      // Guard: already initialized or container missing
-      if (!mapRef.current || mapInstanceRef.current) return;
+    (async () => {
+      if (!containerRef.current || mapRef.current) return;
 
-      const L = (await import('leaflet')).default;
-      await import('leaflet/dist/leaflet.css');
+      const ml = await import('maplibre-gl');
+      await import('maplibre-gl/dist/maplibre-gl.css');
+      if (!mounted || !containerRef.current) return;
 
-      // Guard: component unmounted while awaiting imports
-      if (!mounted || !mapRef.current) return;
+      mlRef.current = ml;
 
-      // Guard: Leaflet already owns this div (strict mode double-invoke)
-      if ((mapRef.current as any)._leaflet_id) return;
+      try {
+        const map = new ml.Map({
+          container: containerRef.current,
+          style: buildStyle() as any,
+          center: [center[1], center[0]], // [lng, lat]
+          zoom,
+          attributionControl: false,
+          fadeDuration: 150,
+        });
 
-      delete (L.Icon.Default.prototype as any)._getIconUrl;
-      L.Icon.Default.mergeOptions({
-        iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
-        iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
-        shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
-      });
+        map.addControl(new ml.AttributionControl({ compact: true }), 'bottom-right');
+        map.addControl(new ml.NavigationControl({ showCompass: false }), 'bottom-right');
 
-      const map = L.map(mapRef.current, {
-        zoomControl: true,
-        attributionControl: false,
-      }).setView(center, zoom);
-
-      L.tileLayer(
-        'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-        { subdomains: 'abcd', maxZoom: 19 }
-      ).addTo(map);
-
-      mapInstanceRef.current = map;
-      if (mounted) setIsLoaded(true);
-    };
-
-    initMap();
+        map.on('load', () => {
+          if (mounted) { mapRef.current = map; setIsLoaded(true); }
+        });
+        map.on('error', (e: any) => console.warn('[LiveMap]', e));
+      } catch (err) {
+        console.error('[LiveMap] init failed:', err);
+        if (mounted) setHasError(true);
+      }
+    })();
 
     return () => {
       mounted = false;
-      if (mapInstanceRef.current) {
-        mapInstanceRef.current.remove();
-        mapInstanceRef.current = null;
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+        markerMapRef.current.clear();
+        activeKeysRef.current.clear();
+        hasFittedBothRef.current = false;
         setIsLoaded(false);
       }
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // ← intentionally empty: center/zoom only apply at creation time
 
-  // Update markers when they change
+  // ─── Markers — smart diff, NO full destroy/recreate ──────────────────────
   useEffect(() => {
-    if (!mapInstanceRef.current || !isLoaded) return;
-    const L = require('leaflet');
+    const map = mapRef.current;
+    const ml  = mlRef.current;
+    if (!map || !ml || !isLoaded) return;
 
-    markersRef.current.forEach((m) => m.remove());
-    markersRef.current = [];
-
-    const iconColors: Record<Marker['type'], string> = {
-      patient: '#ededed',
-      ambulance: '#b0b0b0',
-      hospital: '#7a7a7a',
-    };
+    const incomingKeys = new Set<string>();
 
     markers.forEach((marker) => {
-      const color = iconColors[marker.type];
-      const svgIcon = L.divIcon({
-        className: '',
-        html: `<div style="
-          width: 28px; height: 28px; border-radius: 50%;
-          background: ${color}; border: 2px solid var(--bg-base);
-          display: flex; align-items: center; justify-content: center;
-          box-shadow: 0 2px 8px rgba(0,0,0,0.8);
-          font-size: 12px; color: #050505; font-weight: 700;
-        ">${marker.type === 'patient' ? '🚨' : marker.type === 'ambulance' ? '🚑' : '🏥'}</div>`,
-        iconSize: [28, 28],
-        iconAnchor: [14, 14],
-        popupAnchor: [0, -16],
-      });
+      const key = markerKey(marker);
+      incomingKeys.add(key);
 
-      const m = L.marker([marker.lat, marker.lng], { icon: svgIcon })
-        .addTo(mapInstanceRef.current);
+      if (markerMapRef.current.has(key)) {
+        // Already on map — reposition smoothly (no DOM teardown)
+        markerMapRef.current.get(key).setLngLat([marker.lng, marker.lat]);
+      } else {
+        // New marker type — create once
+        const el = createMarkerEl(marker.type);
+        const mapMarker = new ml.Marker({ element: el, anchor: 'center' })
+          .setLngLat([marker.lng, marker.lat])
+          .addTo(map);
 
-      if (marker.label) {
-        m.bindPopup(
-          `<div style="background:#111;color:#eee;border:1px solid #2a2a2a;padding:6px 10px;border-radius:6px;font-family:monospace;font-size:12px">${marker.label}</div>`,
-          { closeButton: false }
+        if (marker.label) {
+          const popup = new ml.Popup({
+            offset: 24, closeButton: false, closeOnClick: false, maxWidth: '240px',
+          }).setHTML(
+            `<div style="background:#111;color:#EDEDED;border:1px solid #2A2A2A;padding:6px 12px;border-radius:6px;font-family:ui-monospace,monospace;font-size:11px;white-space:nowrap">${marker.label}</div>`
+          );
+          el.addEventListener('click', () => {
+            mapMarker.getPopup()?.isOpen()
+              ? mapMarker.getPopup()?.remove()
+              : (mapMarker.setPopup(popup), mapMarker.togglePopup());
+          });
+        }
+
+        markerMapRef.current.set(key, mapMarker);
+        activeKeysRef.current.add(key);
+      }
+    });
+
+    // Remove markers that are no longer in the incoming list
+    const toRemove: string[] = [];
+    for (const key of activeKeysRef.current) {
+      if (!incomingKeys.has(key)) toRemove.push(key);
+    }
+    toRemove.forEach((key) => {
+      markerMapRef.current.get(key)?.remove();
+      markerMapRef.current.delete(key);
+    });
+    activeKeysRef.current = incomingKeys;
+
+    // ── One-time fitBounds when both patient + ambulance are visible ────────
+    // This gives the user a perfect initial view of both pins.
+    // After this fires once, the user can zoom/pan freely — we never auto-pan again.
+    if (!hasFittedBothRef.current && incomingKeys.size >= 2) {
+      hasFittedBothRef.current = true;
+      const lats = markers.map((m) => m.lat);
+      const lngs = markers.map((m) => m.lng);
+      const minLat = Math.min(...lats);
+      const maxLat = Math.max(...lats);
+      const minLng = Math.min(...lngs);
+      const maxLng = Math.max(...lngs);
+
+      // Only fit if markers are actually at different positions
+      const latDiff = maxLat - minLat;
+      const lngDiff = maxLng - minLng;
+      if (latDiff > 0.0001 || lngDiff > 0.0001) {
+        map.fitBounds(
+          [[minLng, minLat], [maxLng, maxLat]],
+          { padding: 100, duration: 700, maxZoom: 15 }
         );
       }
-
-      markersRef.current.push(m);
-    });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markers, isLoaded]);
 
-  // Draw route
+  // ─── Route polyline ────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!mapInstanceRef.current || !isLoaded) return;
-    const L = require('leaflet');
+    const map = mapRef.current;
+    if (!map || !isLoaded) return;
 
-    if (routeLayerRef.current) {
-      routeLayerRef.current.remove();
-      routeLayerRef.current = null;
-    }
+    const SRC = 'live-route', GLOW = 'live-route-glow', LINE = 'live-route-line';
+    [GLOW, LINE].forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
+    if (map.getSource(SRC)) map.removeSource(SRC);
+    if (!route?.coordinates?.length) return;
 
-    if (route?.coordinates && route.coordinates.length > 0) {
-      const latlngs = route.coordinates.map(([lng, lat]) => [lat, lng] as [number, number]);
-      routeLayerRef.current = L.polyline(latlngs, {
-        color: '#ededed',
-        weight: 3,
-        opacity: 0.8,
-      }).addTo(mapInstanceRef.current);
+    map.addSource(SRC, {
+      type: 'geojson',
+      data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: route.coordinates } },
+    });
+    map.addLayer({ id: GLOW, type: 'line', source: SRC,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: { 'line-color': '#EDEDED', 'line-width': 10, 'line-opacity': 0.1, 'line-blur': 6 } });
+    map.addLayer({ id: LINE, type: 'line', source: SRC,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: { 'line-color': '#EDEDED', 'line-width': 2.5, 'line-opacity': 0.8 } });
 
-      mapInstanceRef.current.fitBounds(routeLayerRef.current.getBounds(), {
-        padding: [30, 30],
-      });
-    }
+    const lngs = route.coordinates.map(([lng]) => lng);
+    const lats = route.coordinates.map(([, lat]) => lat);
+    map.fitBounds(
+      [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
+      { padding: 60, duration: 700, maxZoom: 16 }
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route, isLoaded]);
 
-  // Re-center when center prop changes
-  useEffect(() => {
-    if (mapInstanceRef.current && isLoaded) {
-      mapInstanceRef.current.setView(center, zoom);
-    }
-  }, [center, zoom, isLoaded]);
+  // NOTE: The easeTo re-center effect has been intentionally removed.
+  // Re-centering on every location update would snap the user's zoom level back
+  // to the default (14) and interrupt manual panning — causing the "buggy zoom" issue.
+  // The map is centered correctly at creation time. fitBounds handles the initial
+  // two-pin view. After that the user has full control.
 
   return (
-    <div className="map-container" style={{ height }}>
-      {!isLoaded && (
-        <div
-          className="skeleton"
-          style={{
-            height,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'var(--text-faint)',
-            fontSize: '0.875rem',
-          }}
-        >
-          Loading map...
+    <div className="map-container" style={{
+      height, position: 'relative', borderRadius: '8px',
+      overflow: 'hidden', border: '1px solid #2A2A2A', background: '#0A0A0A',
+    }}>
+      {!isLoaded && !hasError && (
+        <div style={{
+          position: 'absolute', inset: 0, zIndex: 10,
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: '12px', background: '#0A0A0A',
+        }}>
+          <div style={{
+            width: 32, height: 32, border: '2px solid #2A2A2A',
+            borderTopColor: '#EDEDED', borderRadius: '50%',
+            animation: 'spin 0.85s linear infinite',
+          }} />
+          <span style={{ fontSize: '0.8rem', color: '#7A7A7A', letterSpacing: '0.06em', fontFamily: 'monospace' }}>
+            Loading map...
+          </span>
         </div>
       )}
-      <div
-        ref={mapRef}
-        style={{ height, width: '100%', display: isLoaded ? 'block' : 'none' }}
-        id={`live-map-${uid}`}
-      />
+
+      {hasError && (
+        <div style={{
+          position: 'absolute', inset: 0, zIndex: 10,
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: '8px', background: '#0A0A0A', color: '#7A7A7A', fontSize: '0.875rem',
+        }}>
+          <span style={{ fontSize: '1.5rem' }}>⚠️</span>Map failed to load
+        </div>
+      )}
+
+      <div ref={containerRef} id={`livemap-${uid}`} style={{ width: '100%', height: '100%' }} />
+
+      <style>{`
+        #livemap-${uid} .maplibregl-ctrl-attrib {
+          background: rgba(10,10,10,0.85) !important; color: #7A7A7A !important;
+          font-size: 10px !important; border-radius: 4px !important; border: 1px solid #2A2A2A !important;
+        }
+        #livemap-${uid} .maplibregl-ctrl-attrib a { color: #B0B0B0 !important; }
+        #livemap-${uid} .maplibregl-ctrl-group {
+          background: #111111 !important; border: 1px solid #2A2A2A !important;
+          border-radius: 6px !important; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.6) !important;
+        }
+        #livemap-${uid} .maplibregl-ctrl-group button {
+          background: #111111 !important; border-bottom-color: #2A2A2A !important; color: #EDEDED;
+        }
+        #livemap-${uid} .maplibregl-ctrl-group button:hover { background: #1A1A1A !important; }
+        #livemap-${uid} .maplibregl-ctrl-icon { filter: invert(1); opacity: 0.75; }
+        #livemap-${uid} .maplibregl-popup-content {
+          background: transparent !important; padding: 0 !important; box-shadow: none !important;
+        }
+        #livemap-${uid} .maplibregl-popup-tip { display: none !important; }
+      `}</style>
     </div>
   );
 }

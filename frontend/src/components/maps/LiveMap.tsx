@@ -13,11 +13,27 @@ interface Route {
   coordinates: [number, number][]; // [lng, lat] pairs
 }
 
+/**
+ * Dijkstra search-flood animation payload. Bump `runId` to (re)start the flood.
+ *  - segments : road segments in the order Dijkstra settled them
+ *  - source   : [lng, lat] gold origin dot (driver)
+ *  - target   : [lng, lat] green destination dot (patient)
+ */
+interface SearchViz {
+  segments: [number, number][][];
+  source: [number, number];
+  target: [number, number];
+  runId: number;
+}
+
 interface LiveMapProps {
   center: [number, number]; // [lat, lng] — only used for initial map creation
   zoom?: number;            // only used for initial map creation
   markers?: Marker[];
   route?: Route;
+  search?: SearchViz | null;
+  /** Fired once the flood reaches the target / finishes. */
+  onSearchComplete?: () => void;
   height?: string;
 }
 
@@ -72,6 +88,8 @@ export default function LiveMap({
   zoom = 14,
   markers = [],
   route,
+  search,
+  onSearchComplete,
   height = '400px',
 }: LiveMapProps) {
   const uid = useId().replace(/:/g, '-');
@@ -89,6 +107,12 @@ export default function LiveMap({
   const hasFittedBothRef = useRef(false);
   // Same idea for the route: fit to the route once, never snap again.
   const hasFittedRouteRef = useRef(false);
+
+  // Dijkstra flood animation bookkeeping.
+  const searchRafRef = useRef<number | null>(null);
+  const lastRunIdRef = useRef<number>(-1);
+  const onSearchCompleteRef = useRef(onSearchComplete);
+  onSearchCompleteRef.current = onSearchComplete;
 
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasError, setHasError] = useState(false);
@@ -131,6 +155,10 @@ export default function LiveMap({
 
     return () => {
       mounted = false;
+      if (searchRafRef.current) {
+        cancelAnimationFrame(searchRafRef.current);
+        searchRafRef.current = null;
+      }
       if (mapRef.current) {
         mapRef.current.remove();
         mapRef.current = null;
@@ -270,6 +298,184 @@ export default function LiveMap({
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route, isLoaded]);
+
+  // ─── Dijkstra search flood-fill animation ──────────────────────────────────
+  // When `search` is provided with a new runId, animate the exploration of the
+  // road network from the source (gold) outward until it reaches the target
+  // (green) — the classic Dijkstra visualisation. On completion, onSearchComplete
+  // fires so the caller can reveal the final route.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isLoaded) return;
+    if (!search || !search.segments?.length) return;
+    if (search.runId === lastRunIdRef.current) return; // already played this run
+    lastRunIdRef.current = search.runId;
+
+    const EXPLORED = 'dijkstra-explored';
+    const FRONTIER = 'dijkstra-frontier';
+    const ENDPTS = 'dijkstra-endpoints';
+    const L_EXPLORED_GLOW = 'dijkstra-explored-glow';
+    const L_EXPLORED = 'dijkstra-explored-line';
+    const L_FRONTIER = 'dijkstra-frontier-line';
+    const L_ENDPTS = 'dijkstra-endpoints-pts';
+
+    const emptyFC = () => ({ type: 'FeatureCollection' as const, features: [] as any[] });
+
+    const ensureLayers = () => {
+      if (!map.getSource(EXPLORED)) {
+        map.addSource(EXPLORED, { type: 'geojson', data: emptyFC() });
+        // Soft blue glow under the explored web
+        map.addLayer({
+          id: L_EXPLORED_GLOW, type: 'line', source: EXPLORED,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': '#1E4Fff', 'line-width': 4, 'line-opacity': 0.25, 'line-blur': 3 },
+        });
+        // Crisp explored edges
+        map.addLayer({
+          id: L_EXPLORED, type: 'line', source: EXPLORED,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': '#3B82F6', 'line-width': 1.4, 'line-opacity': 0.7 },
+        });
+      }
+      if (!map.getSource(FRONTIER)) {
+        map.addSource(FRONTIER, { type: 'geojson', data: emptyFC() });
+        // Bright leading edge of the flood
+        map.addLayer({
+          id: L_FRONTIER, type: 'line', source: FRONTIER,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': '#7DD3FC', 'line-width': 2.4, 'line-opacity': 0.95, 'line-blur': 0.4 },
+        });
+      }
+      if (!map.getSource(ENDPTS)) {
+        map.addSource(ENDPTS, { type: 'geojson', data: emptyFC() });
+        map.addLayer({
+          id: L_ENDPTS, type: 'circle', source: ENDPTS,
+          paint: {
+            'circle-radius': ['case', ['==', ['get', 'role'], 'source'], 7, 8],
+            'circle-color': ['case', ['==', ['get', 'role'], 'source'], '#FFD23F', '#22C55E'],
+            'circle-blur': 0.5,
+            'circle-opacity': 0.95,
+            'circle-stroke-width': ['case', ['==', ['get', 'role'], 'source'], 3, 3],
+            'circle-stroke-color': ['case', ['==', ['get', 'role'], 'source'], 'rgba(255,210,63,0.35)', 'rgba(34,197,94,0.35)'],
+          },
+        });
+      }
+    };
+
+    const clearViz = () => {
+      [L_EXPLORED_GLOW, L_EXPLORED, L_FRONTIER, L_ENDPTS].forEach((id) => {
+        if (map.getLayer(id)) map.removeLayer(id);
+      });
+      [EXPLORED, FRONTIER, ENDPTS].forEach((id) => {
+        if (map.getSource(id)) map.removeSource(id);
+      });
+    };
+
+    // Fresh start
+    if (searchRafRef.current) cancelAnimationFrame(searchRafRef.current);
+    clearViz();
+    ensureLayers();
+
+    const segments = search.segments;
+    const total = segments.length;
+
+    // Endpoints (gold source + green target) — drawn for the whole animation.
+    map.getSource(ENDPTS)?.setData({
+      type: 'FeatureCollection',
+      features: [
+        { type: 'Feature', properties: { role: 'source' }, geometry: { type: 'Point', coordinates: search.source } },
+        { type: 'Feature', properties: { role: 'target' }, geometry: { type: 'Point', coordinates: search.target } },
+      ],
+    });
+
+    // Frame in on the search area once.
+    {
+      const lngs: number[] = [search.source[0], search.target[0]];
+      const lats: number[] = [search.source[1], search.target[1]];
+      for (const seg of segments) for (const [lng, lat] of seg) { lngs.push(lng); lats.push(lat); }
+      map.fitBounds(
+        [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
+        { padding: 70, duration: 600, maxZoom: 16 }
+      );
+    }
+
+    // Reveal ~7.5s total regardless of graph size, with a bright frontier band.
+    // Slower pace gives the search a deliberate, dramatic "feel".
+    const DURATION_MS = 7500;
+    const FRONTIER_BAND = Math.max(12, Math.round(total * 0.05));
+    const exploredFeatures: any[] = [];
+    let revealed = 0;
+    const start = performance.now();
+
+    const lineFeature = (seg: [number, number][]) => ({
+      type: 'Feature' as const,
+      properties: {},
+      geometry: { type: 'LineString' as const, coordinates: seg },
+    });
+
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / DURATION_MS);
+      // ease-out so the flood bursts quickly then settles
+      const eased = 1 - Math.pow(1 - t, 2);
+      const target = Math.floor(eased * total);
+
+      // Append newly explored edges to the explored web.
+      for (; revealed < target; revealed++) {
+        exploredFeatures.push(lineFeature(segments[revealed]));
+      }
+      map.getSource(EXPLORED)?.setData({ type: 'FeatureCollection', features: exploredFeatures });
+
+      // Bright frontier = the most recently revealed band.
+      const frontStart = Math.max(0, target - FRONTIER_BAND);
+      const frontFeatures = [];
+      for (let i = frontStart; i < target; i++) frontFeatures.push(lineFeature(segments[i]));
+      map.getSource(FRONTIER)?.setData({ type: 'FeatureCollection', features: frontFeatures });
+
+      if (t < 1) {
+        searchRafRef.current = requestAnimationFrame(tick);
+      } else {
+        // Flash off the frontier, keep the explored web faintly, then signal done.
+        map.getSource(FRONTIER)?.setData(emptyFC());
+        searchRafRef.current = null;
+        // Fade the explored web down so the route reads clearly on top.
+        if (map.getLayer(L_EXPLORED)) map.setPaintProperty(L_EXPLORED, 'line-opacity', 0.32);
+        if (map.getLayer(L_EXPLORED_GLOW)) map.setPaintProperty(L_EXPLORED_GLOW, 'line-opacity', 0.12);
+        onSearchCompleteRef.current?.();
+      }
+    };
+
+    searchRafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (searchRafRef.current) {
+        cancelAnimationFrame(searchRafRef.current);
+        searchRafRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search?.runId, isLoaded]);
+
+  // Clear the Dijkstra flood layers when the search is dismissed (search = null).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isLoaded) return;
+    if (search) return; // active search — leave layers in place
+
+    if (searchRafRef.current) {
+      cancelAnimationFrame(searchRafRef.current);
+      searchRafRef.current = null;
+    }
+    lastRunIdRef.current = -1;
+    const ids = [
+      'dijkstra-explored-glow', 'dijkstra-explored-line',
+      'dijkstra-frontier-line', 'dijkstra-endpoints-pts',
+    ];
+    ids.forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
+    ['dijkstra-explored', 'dijkstra-frontier', 'dijkstra-endpoints'].forEach((id) => {
+      if (map.getSource(id)) map.removeSource(id);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, isLoaded]);
 
   // NOTE: The easeTo re-center effect has been intentionally removed.
   // Re-centering on every location update would snap the user's zoom level back

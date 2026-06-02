@@ -11,6 +11,7 @@ import { assignmentApi } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 import { useSocket } from '@/hooks/useSocket';
 import { useRoute } from '@/hooks/useRoute';
+import { computeDijkstraViz } from '@/lib/dijkstraViz';
 import Sidebar from '@/components/layout/Sidebar';
 import Topbar from '@/components/layout/Topbar';
 import { PriorityBadge, StatusBadge } from '@/components/dashboard/PriorityBadge';
@@ -42,6 +43,24 @@ export default function DriverDashboard() {
   // Once the driver submits a manual location, we stop the GPS watcher entirely
   // so it can never fire and snap the marker back to the device's real GPS coords.
   const manualOverrideRef = useRef(false);
+
+  // ── Dijkstra route-search visualisation ─────────────────────────────────────
+  // When the driver accepts, we play a flood-fill search over the real road
+  // network (driver → patient) before revealing the route. While the flood is
+  // playing we hide the plain route line; when it completes we show it.
+  const [searchViz, setSearchViz] = useState<{
+    segments: [number, number][][];
+    source: [number, number];
+    target: [number, number];
+    runId: number;
+  } | null>(null);
+  // The shortest path computed by the Dijkstra search itself ([lng,lat][]).
+  // Used as the route to lock in when the flood completes — always available,
+  // so the route never depends on a racing OSRM fetch.
+  const [dijkstraPath, setDijkstraPath] = useState<[number, number][] | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const searchRunIdRef = useRef(0);
+  const searchAbortRef = useRef<AbortController | null>(null);
 
   // Auth guard
   useEffect(() => {
@@ -149,14 +168,95 @@ export default function DriverDashboard() {
 
   // ── Action handlers ────────────────────────────────────────────────────────
 
+  // Launch the Dijkstra flood-fill search over the real road network, from the
+  // driver's current position to the patient. Falls back silently (no flood,
+  // route shows normally) if we can't determine the driver location.
+  const startRouteSearch = useCallback(
+    async (assignment: Assignment) => {
+      const req = assignment.emergency_requests as any;
+      const patient =
+        req?.latitude && req?.longitude
+          ? { lat: req.latitude as number, lng: req.longitude as number }
+          : null;
+      if (!patient) return;
+
+      // Resolve a driver origin: live GPS state, else a one-shot geolocation read.
+      let origin = driverPos;
+      if (!origin && typeof navigator !== 'undefined' && navigator.geolocation) {
+        origin = await new Promise<{ lat: number; lng: number } | null>((resolve) => {
+          navigator.geolocation.getCurrentPosition(
+            (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+            () => resolve(null),
+            { enableHighAccuracy: true, timeout: 6000, maximumAge: 10000 }
+          );
+        });
+      }
+      if (!origin) return; // no origin → skip flood, route will draw normally
+
+      searchAbortRef.current?.abort();
+      const controller = new AbortController();
+      searchAbortRef.current = controller;
+
+      // Hard safety timeout: if Overpass/graph build hangs, abort and let the
+      // normal route render so the driver is never stuck on a blank search.
+      const safety = setTimeout(() => controller.abort(), 12000);
+
+      setIsSearching(true);
+      try {
+        const viz = await computeDijkstraViz(
+          [origin.lng, origin.lat],
+          [patient.lng, patient.lat],
+          controller.signal
+        );
+        clearTimeout(safety);
+        const isCurrent = searchAbortRef.current === controller;
+        if (controller.signal.aborted) {
+          if (isCurrent) setIsSearching(false); // safety-aborted → reveal normal route
+          return;
+        }
+        if (!isCurrent) return; // superseded by a newer search
+        if (!viz.exploreSegments.length) {
+          // Nothing to flood (degenerate graph) — skip straight to the route.
+          setIsSearching(false);
+          return;
+        }
+        searchRunIdRef.current += 1;
+        setDijkstraPath(viz.path && viz.path.length > 1 ? viz.path : null);
+        setSearchViz({
+          segments: viz.exploreSegments,
+          source: viz.source,
+          target: viz.target,
+          runId: searchRunIdRef.current,
+        });
+      } catch {
+        // Any failure → no flood; route falls back to normal rendering.
+        clearTimeout(safety);
+        if (searchAbortRef.current === controller) setIsSearching(false);
+      }
+    },
+    [driverPos]
+  );
+
   const handleAccept = async () => {
     if (!activeAssignment) return;
     setIsAccepting(true);
     try {
       const res = await assignmentApi.accept(activeAssignment.id);
       if (res.data.success) {
-        setActiveAssignment(res.data.data);
-        toast.success('Assignment accepted! Navigate to the patient.');
+        // Merge: never lose the emergency_requests / ambulances joins even if a
+        // backend response comes back bare — the route search needs patient coords.
+        const accepted = res.data.data as Assignment;
+        const merged: Assignment = {
+          ...activeAssignment,
+          ...accepted,
+          emergency_requests:
+            (accepted as any).emergency_requests ?? activeAssignment.emergency_requests,
+          ambulances: (accepted as any).ambulances ?? activeAssignment.ambulances,
+        };
+        setActiveAssignment(merged);
+        toast.success('Assignment accepted! Computing shortest route...');
+        // Kick off the Dijkstra route-search visualisation (non-blocking).
+        startRouteSearch(merged);
       }
     } catch (err: any) {
       toast.error(err.message);
@@ -189,6 +289,9 @@ export default function DriverDashboard() {
       if (res.data.success) {
         setActiveAssignment(null);
         setDriverPos(null);
+        setSearchViz(null);
+        setDijkstraPath(null);
+        setIsSearching(false);
         toast.success('Trip completed! Great work.');
       }
     } catch (err: any) {
@@ -257,7 +360,8 @@ export default function DriverDashboard() {
         : null,
     [emergencyReq?.latitude, emergencyReq?.longitude]
   );
-  // Show the navigation route while heading to the patient (before pickup).
+  // Pre-fetch the route geometry as soon as we're heading to the patient
+  // (covers reloads mid-trip), but DISPLAY is gated separately below.
   const showRouteToPatient =
     !!activeAssignment &&
     ['assigned', 'accepted', 'en_route'].includes(activeAssignment.status);
@@ -265,6 +369,30 @@ export default function DriverDashboard() {
     showRouteToPatient ? driverPos : null,
     showRouteToPatient ? patientPos : null
   );
+
+  // Display rules for the final route line:
+  //  - Hidden during 'assigned' (before Accept) → driver only sees markers.
+  //  - Hidden while the Dijkstra flood is computing/playing (isSearching).
+  //  - Shown once status is accepted/en_route AND the flood has finished.
+  //    (On a mid-trip reload there's no flood, so it shows immediately.)
+  // Prefer the Dijkstra-computed shortest path (always available the instant the
+  // flood exists); fall back to the OSRM road route only if no Dijkstra path.
+  const routeCoords =
+    dijkstraPath && dijkstraPath.length > 1
+      ? dijkstraPath
+      : route?.coordinates;
+  const routeForMap =
+    routeCoords &&
+    !isSearching &&
+    !!activeAssignment &&
+    ['accepted', 'en_route'].includes(activeAssignment.status)
+      ? { coordinates: routeCoords }
+      : undefined;
+
+  // Called by LiveMap when the flood reaches the patient: reveal the route.
+  const handleSearchComplete = useCallback(() => {
+    setIsSearching(false);
+  }, []);
 
   // Early return AFTER all hooks
   if (authLoading || isLoading) {
@@ -289,14 +417,37 @@ export default function DriverDashboard() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '1.5rem', alignItems: 'start' }}>
 
               {/* ── Map ─────────────────────────────────────────── */}
-              <div>
+              <div style={{ position: 'relative' }}>
                 <LiveMap
                   center={mapCenter}
                   markers={mapMarkers}
-                  route={route ? { coordinates: route.coordinates } : undefined}
+                  route={routeForMap}
+                  search={searchViz}
+                  onSearchComplete={handleSearchComplete}
                   height="450px"
                   zoom={14}
                 />
+
+                {isSearching && (
+                  <div
+                    style={{
+                      position: 'absolute', top: 12, left: 12, zIndex: 20,
+                      display: 'flex', alignItems: 'center', gap: '0.5rem',
+                      padding: '0.5rem 0.875rem', borderRadius: '8px',
+                      background: 'rgba(10,10,10,0.82)', border: '1px solid #2A2A2A',
+                      backdropFilter: 'blur(6px)', pointerEvents: 'none',
+                    }}
+                  >
+                    <span style={{
+                      width: 9, height: 9, borderRadius: '50%',
+                      background: '#7DD3FC', boxShadow: '0 0 10px 2px rgba(125,211,252,0.8)',
+                      animation: 'pulse 1.1s ease-in-out infinite',
+                    }} />
+                    <span style={{ fontSize: '0.75rem', fontFamily: 'monospace', color: '#EDEDED', letterSpacing: '0.04em' }}>
+                      Dijkstra · searching shortest path…
+                    </span>
+                  </div>
+                )}
 
                 {/* Manual location panel */}
                 <div className="card" style={{ marginTop: '0.875rem', padding: '1rem' }}>

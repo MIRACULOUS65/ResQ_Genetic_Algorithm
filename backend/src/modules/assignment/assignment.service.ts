@@ -223,7 +223,15 @@ export const acceptAssignmentService = async (
     });
   }
 
-  return data as unknown as Assignment;
+  // Return the FULL assignment (with request + ambulance joins) so the driver
+  // dashboard keeps patient coordinates for the route-search visualisation.
+  const { data: full } = await supabaseAdmin
+    .from('assignments')
+    .select('*, emergency_requests(*), ambulances(*)')
+    .eq('id', id)
+    .single();
+
+  return (full || data) as unknown as Assignment;
 };
 
 /**

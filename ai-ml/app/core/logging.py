@@ -15,6 +15,8 @@ def get_logger(name: str) -> logging.Logger:
         handler.setFormatter(logging.Formatter(LOG_FORMAT))
         logger.addHandler(handler)
     logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+    # Prevent double-logging: don't propagate to the root logger
+    logger.propagate = False
     return logger
 
 
@@ -28,3 +30,13 @@ def setup_logging() -> None:
     # Suppress noisy third-party loggers
     for noisy in ("uvicorn.access", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Suppress sklearn feature-name warnings that appear when scaler
+    # was fitted with a DataFrame but transform receives a numpy array.
+    # (Fixed at source in *_service.py — this is a belt-and-suspenders guard.)
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message="X does not have valid feature names",
+        category=UserWarning,
+        module="sklearn",
+    )

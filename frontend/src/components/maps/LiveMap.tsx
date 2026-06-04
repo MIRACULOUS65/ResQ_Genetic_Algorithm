@@ -26,6 +26,18 @@ interface SearchViz {
   runId: number;
 }
 
+/**
+ * Genetic-Algorithm candidate-scan animation payload. Bump `runId` to (re)play.
+ * Visualises the GA evaluating every available unit before locking the winner:
+ *  - patient   : [lng, lat] emergency origin
+ *  - candidates: every available ambulance with its position + winner flag
+ */
+interface GAScanViz {
+  patient: [number, number];
+  candidates: { lng: number; lat: number; isWinner: boolean; fitness: number | null }[];
+  runId: number;
+}
+
 interface LiveMapProps {
   center: [number, number]; // [lat, lng] — only used for initial map creation
   zoom?: number;            // only used for initial map creation
@@ -34,6 +46,10 @@ interface LiveMapProps {
   search?: SearchViz | null;
   /** Fired once the flood reaches the target / finishes. */
   onSearchComplete?: () => void;
+  /** GA candidate-scan animation (plays before the route flood). */
+  gaScan?: GAScanViz | null;
+  /** Fired once the GA scan animation completes. */
+  onGAScanComplete?: () => void;
   height?: string;
 }
 
@@ -90,6 +106,8 @@ export default function LiveMap({
   route,
   search,
   onSearchComplete,
+  gaScan,
+  onGAScanComplete,
   height = '400px',
 }: LiveMapProps) {
   const uid = useId().replace(/:/g, '-');
@@ -113,6 +131,12 @@ export default function LiveMap({
   const lastRunIdRef = useRef<number>(-1);
   const onSearchCompleteRef = useRef(onSearchComplete);
   onSearchCompleteRef.current = onSearchComplete;
+
+  // GA candidate-scan animation bookkeeping.
+  const gaRafRef = useRef<number | null>(null);
+  const lastGaRunIdRef = useRef<number>(-1);
+  const onGAScanCompleteRef = useRef(onGAScanComplete);
+  onGAScanCompleteRef.current = onGAScanComplete;
 
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasError, setHasError] = useState(false);
@@ -158,6 +182,10 @@ export default function LiveMap({
       if (searchRafRef.current) {
         cancelAnimationFrame(searchRafRef.current);
         searchRafRef.current = null;
+      }
+      if (gaRafRef.current) {
+        cancelAnimationFrame(gaRafRef.current);
+        gaRafRef.current = null;
       }
       if (mapRef.current) {
         mapRef.current.remove();
@@ -298,6 +326,130 @@ export default function LiveMap({
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route, isLoaded]);
+
+  // ─── GA candidate-scan animation ───────────────────────────────────────────
+  // When `gaScan` is provided with a new runId, sweep a pulsing scan line from
+  // the patient to each candidate ambulance (the GA "evaluating" each unit),
+  // then lock onto the winner with a glowing ring. Purely additive — it shares
+  // the map with the Dijkstra flood + route but uses its own layers.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isLoaded) return;
+    if (!gaScan || !gaScan.candidates?.length) return;
+    if (gaScan.runId === lastGaRunIdRef.current) return;
+    lastGaRunIdRef.current = gaScan.runId;
+
+    const SRC_LINKS = 'ga-links';
+    const SRC_NODES = 'ga-nodes';
+    const SRC_WIN = 'ga-winner';
+    const L_LINKS = 'ga-links-line';
+    const L_NODES = 'ga-nodes-pt';
+    const L_WIN_GLOW = 'ga-winner-glow';
+    const L_WIN = 'ga-winner-pt';
+
+    const emptyFC = () => ({ type: 'FeatureCollection' as const, features: [] as any[] });
+
+    const clear = () => {
+      [L_LINKS, L_NODES, L_WIN_GLOW, L_WIN].forEach((id) => { if (map.getLayer(id)) map.removeLayer(id); });
+      [SRC_LINKS, SRC_NODES, SRC_WIN].forEach((id) => { if (map.getSource(id)) map.removeSource(id); });
+    };
+
+    if (gaRafRef.current) cancelAnimationFrame(gaRafRef.current);
+    clear();
+
+    map.addSource(SRC_LINKS, { type: 'geojson', data: emptyFC() });
+    map.addLayer({
+      id: L_LINKS, type: 'line', source: SRC_LINKS,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: { 'line-color': '#b9b9e6', 'line-width': 1.6, 'line-opacity': 0.55, 'line-dasharray': [2, 2] },
+    });
+    map.addSource(SRC_NODES, { type: 'geojson', data: emptyFC() });
+    map.addLayer({
+      id: L_NODES, type: 'circle', source: SRC_NODES,
+      paint: {
+        'circle-radius': 5,
+        'circle-color': '#8f8fb8',
+        'circle-blur': 0.4,
+        'circle-opacity': 0.9,
+        'circle-stroke-width': 2,
+        'circle-stroke-color': 'rgba(180,180,220,0.3)',
+      },
+    });
+    map.addSource(SRC_WIN, { type: 'geojson', data: emptyFC() });
+    map.addLayer({
+      id: L_WIN_GLOW, type: 'circle', source: SRC_WIN,
+      paint: { 'circle-radius': 16, 'circle-color': '#e8e8f4', 'circle-blur': 1, 'circle-opacity': 0.35 },
+    });
+    map.addLayer({
+      id: L_WIN, type: 'circle', source: SRC_WIN,
+      paint: {
+        'circle-radius': 7, 'circle-color': '#f4f4fb', 'circle-opacity': 0.95,
+        'circle-stroke-width': 3, 'circle-stroke-color': 'rgba(220,220,250,0.45)',
+      },
+    });
+
+    const patient = gaScan.patient;
+    const cands = gaScan.candidates;
+    const total = cands.length;
+    const PER = 520;            // ms per candidate scan
+    const DURATION = Math.min(4200, Math.max(1600, total * PER));
+    const start = performance.now();
+
+    const linkFeature = (c: { lng: number; lat: number }) => ({
+      type: 'Feature' as const, properties: {},
+      geometry: { type: 'LineString' as const, coordinates: [patient, [c.lng, c.lat]] },
+    });
+    const nodeFeature = (c: { lng: number; lat: number }) => ({
+      type: 'Feature' as const, properties: {},
+      geometry: { type: 'Point' as const, coordinates: [c.lng, c.lat] },
+    });
+
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / DURATION);
+      const revealed = Math.max(1, Math.floor(t * total));
+      const shown = cands.slice(0, revealed);
+      map.getSource(SRC_LINKS)?.setData({ type: 'FeatureCollection', features: shown.map(linkFeature) });
+      map.getSource(SRC_NODES)?.setData({ type: 'FeatureCollection', features: shown.map(nodeFeature) });
+
+      if (t < 1) {
+        gaRafRef.current = requestAnimationFrame(tick);
+      } else {
+        // Lock the winner
+        const winner = cands.find((c) => c.isWinner) ?? cands[0];
+        map.getSource(SRC_WIN)?.setData({
+          type: 'FeatureCollection',
+          features: [nodeFeature(winner)],
+        });
+        // Fade the scan web so the winner reads clearly
+        if (map.getLayer(L_LINKS)) map.setPaintProperty(L_LINKS, 'line-opacity', 0.18);
+        if (map.getLayer(L_NODES)) map.setPaintProperty(L_NODES, 'circle-opacity', 0.4);
+        gaRafRef.current = null;
+        onGAScanCompleteRef.current?.();
+      }
+    };
+    gaRafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (gaRafRef.current) { cancelAnimationFrame(gaRafRef.current); gaRafRef.current = null; }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gaScan?.runId, isLoaded]);
+
+  // Clear GA scan layers when dismissed (gaScan = null).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isLoaded) return;
+    if (gaScan) return;
+    if (gaRafRef.current) { cancelAnimationFrame(gaRafRef.current); gaRafRef.current = null; }
+    lastGaRunIdRef.current = -1;
+    ['ga-links-line', 'ga-nodes-pt', 'ga-winner-glow', 'ga-winner-pt'].forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    });
+    ['ga-links', 'ga-nodes', 'ga-winner'].forEach((id) => {
+      if (map.getSource(id)) map.removeSource(id);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gaScan, isLoaded]);
 
   // ─── Dijkstra search flood-fill animation ──────────────────────────────────
   // When `search` is provided with a new runId, animate the exploration of the

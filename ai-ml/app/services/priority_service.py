@@ -51,7 +51,7 @@ def predict_priority(request_data: Dict[str, Any]) -> Dict[str, Any]:
         if feat not in df.columns:
             df[feat] = 0
 
-    X = df[PRIORITY_FEATURES].fillna(0).astype(float).values
+    X = df[PRIORITY_FEATURES].fillna(0).astype(float)
     X_scaled = scaler.transform(X)
 
     le = encoders.get("target_le")

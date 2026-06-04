@@ -56,10 +56,14 @@ create table if not exists assignments (
   status text not null default 'assigned' check (
     status in ('assigned', 'accepted', 'en_route', 'picked_up', 'completed', 'cancelled')
   ),
+  ga_metrics jsonb, -- Genetic Algorithm decision snapshot (why this unit was chosen)
   assigned_at timestamptz not null default now(),
   accepted_at timestamptz,
   completed_at timestamptz
 );
+
+-- Idempotent add for existing databases
+alter table assignments add column if not exists ga_metrics jsonb;
 
 -- ── Tracking Logs ────────────────────────────────────────────────
 create table if not exists tracking_logs (

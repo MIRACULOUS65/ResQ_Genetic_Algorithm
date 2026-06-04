@@ -89,6 +89,9 @@ export interface OptimizeResult {
   distance_km: number | null;
   backup_suggestions: OptimizeBackup[];
   reason_for_assignment: string;
+  /** GA run statistics (when the genetic algorithm produced the result) */
+  generations_run: number | null;
+  population_size: number | null;
   /** true when the result came from the rule-based fallback, not the GA service */
   fallback: boolean;
 }
@@ -273,6 +276,8 @@ export async function optimizeAmbulance(
         : [],
       reason_for_assignment:
         data?.reason_for_assignment ?? 'Ambulance selected by Genetic Algorithm.',
+      generations_run: data?.ga_metadata?.generations_run ?? null,
+      population_size: data?.ga_metadata?.population_size ?? null,
       fallback: false,
     };
   } catch {
@@ -299,6 +304,8 @@ function nearestAvailableFallback(
       distance_km: null,
       backup_suggestions: [],
       reason_for_assignment: 'No available ambulances in the fleet.',
+      generations_run: null,
+      population_size: null,
       fallback: true,
     };
   }
@@ -329,6 +336,8 @@ function nearestAvailableFallback(
     reason_for_assignment: `Nearest available ambulance selected (fallback). Distance: ${best.dist.toFixed(
       2
     )} km.`,
+    generations_run: null,
+    population_size: null,
     fallback: true,
   };
 }

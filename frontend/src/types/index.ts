@@ -81,6 +81,50 @@ export interface Assignment {
   // Joined fields
   emergency_requests?: EmergencyRequest;
   ambulances?: Ambulance;
+  // GA decision snapshot (why this unit was chosen)
+  ga_metrics?: GAMetrics;
+}
+
+// ── Genetic Algorithm decision snapshot ─────────────────────────
+
+export interface GACandidate {
+  id: string;
+  vehicle_number: string;
+  latitude: number;
+  longitude: number;
+  is_winner: boolean;
+  is_backup: boolean;
+  fitness: number | null;
+}
+
+export interface GABackup {
+  ambulance_id: string;
+  fitness: number;
+  eta_minutes: number;
+}
+
+export interface GAMetrics {
+  engine: 'genetic_algorithm' | 'heuristic';
+  fallback: boolean;
+  priority: Priority;
+  priority_confidence: number;
+  traffic_level: string;
+  congestion_multiplier: number;
+  congestion_pct: number;
+  hotspot_risk: number;
+  hotspot_category: string;
+  fitness_score: number | null;
+  distance_km: number | null;
+  eta_minutes: number;
+  reason: string;
+  generations_run: number | null;
+  population_size: number | null;
+  fleet_size: number;
+  candidates_evaluated: number;
+  backup_suggestions: GABackup[];
+  candidates: GACandidate[];
+  winner: { id: string; vehicle_number: string; latitude: number; longitude: number } | null;
+  computed_at: string;
 }
 
 export interface TrackingLog {
@@ -138,10 +182,12 @@ export interface RequestStatusEvent {
   assignment_id: string;
   priority?: Priority;
   eta?: number;
+  ga_metrics?: GAMetrics;
 }
 
 export interface NewAssignmentEvent {
   assignment: Assignment;
   request: EmergencyRequest;
   eta: number;
+  ga_metrics?: GAMetrics;
 }

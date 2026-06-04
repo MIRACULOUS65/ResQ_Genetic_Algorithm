@@ -50,7 +50,7 @@ def predict_hotspot(request_data: Dict[str, Any]) -> Dict[str, Any]:
         if feat not in df.columns:
             df[feat] = 0
 
-    X = df[HOTSPOT_FEATURES].fillna(0).astype(float).values
+    X = df[HOTSPOT_FEATURES].fillna(0).astype(float)
     X_scaled = scaler.transform(X)
 
     risk_score = float(np.clip(model.predict(X_scaled)[0], 0.0, 1.0))

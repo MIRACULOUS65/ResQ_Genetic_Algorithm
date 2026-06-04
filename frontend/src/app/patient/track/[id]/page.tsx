@@ -11,8 +11,9 @@ import { useRoute } from '@/hooks/useRoute';
 import Sidebar from '@/components/layout/Sidebar';
 import Topbar from '@/components/layout/Topbar';
 import StatusStepper from '@/components/dashboard/StatusStepper';
+import GAMetricsPanel from '@/components/dashboard/GAMetricsPanel';
 import { PriorityBadge, StatusBadge } from '@/components/dashboard/PriorityBadge';
-import { EmergencyRequest, DriverLocationEvent, RequestStatusEvent } from '@/types';
+import { EmergencyRequest, DriverLocationEvent, RequestStatusEvent, GAMetrics } from '@/types';
 import dynamic from 'next/dynamic';
 
 const LiveMap = dynamic(() => import('@/components/maps/LiveMap'), { ssr: false });
@@ -21,6 +22,7 @@ interface AssignmentData {
   id: string;
   eta: number;
   status: string;
+  ga_metrics?: GAMetrics;
   ambulances?: {
     vehicle_number: string;
     latitude: number;
@@ -40,6 +42,13 @@ export default function TrackPage() {
   const [ambulancePos, setAmbulancePos] = useState<{ lat: number; lng: number } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [assignmentRoomId, setAssignmentRoomId] = useState<string | null>(null);
+  const [gaMetrics, setGaMetrics] = useState<GAMetrics | null>(null);
+  const [gaScan, setGaScan] = useState<{
+    patient: [number, number];
+    candidates: { lng: number; lat: number; isWinner: boolean; fitness: number | null }[];
+    runId: number;
+  } | null>(null);
+  const gaScanRunIdRef = useRef(0);
 
   // Once a live socket GPS update arrives, stop letting the 10-second DB poll
   // overwrite ambulancePos with stale coordinates (which may match patient's location).
@@ -64,6 +73,22 @@ export default function TrackPage() {
       if (asnRes.data.success && asnRes.data.data) {
         const asn = asnRes.data.data as AssignmentData;
         setAssignment(asn);
+
+        // Capture GA decision metrics + trigger the candidate-scan animation once.
+        if (asn.ga_metrics) {
+          setGaMetrics(asn.ga_metrics);
+          const reqData = reqRes.data?.data as EmergencyRequest | undefined;
+          if (reqData?.latitude && reqData?.longitude && asn.ga_metrics.candidates?.length) {
+            gaScanRunIdRef.current += 1;
+            setGaScan({
+              patient: [reqData.longitude, reqData.latitude],
+              candidates: asn.ga_metrics.candidates.map((c) => ({
+                lng: c.longitude, lat: c.latitude, isWinner: c.is_winner, fitness: c.fitness,
+              })),
+              runId: gaScanRunIdRef.current,
+            });
+          }
+        }
 
         // Seed ambulancePos from DB if the driver has already shared their location
         // AND we haven't received a live socket update yet.
@@ -224,6 +249,7 @@ export default function TrackPage() {
                 center={mapCenter}
                 markers={mapMarkers}
                 route={route ? { coordinates: route.coordinates } : undefined}
+                gaScan={gaScan}
                 height="460px"
                 zoom={14}
               />
@@ -301,6 +327,11 @@ export default function TrackPage() {
 
             <div>
               <StatusStepper currentStatus={request.status} />
+              {gaMetrics && (
+                <div style={{ marginTop: '1.25rem' }}>
+                  <GAMetricsPanel metrics={gaMetrics} compact />
+                </div>
+              )}
             </div>
           </div>
         </div>

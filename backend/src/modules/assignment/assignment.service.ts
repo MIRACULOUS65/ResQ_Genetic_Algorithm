@@ -29,7 +29,7 @@ export const triggerAllocationService = async (
   const io = getIo();
 
   // Step 1: Predict priority (AI model 1)
-  const { priority } = await predictPriority(request);
+  const { priority, confidence: priorityConfidence } = await predictPriority(request);
   await updateEmergencyStatusService(request.id, 'pending', priority);
 
   // Step 2: Get available ambulances
@@ -60,6 +60,51 @@ export const triggerAllocationService = async (
 
   const etaMinutes = Math.max(1, Math.round(allocation.estimated_eta_minutes ?? 0));
 
+  // ── Build the GA intelligence snapshot ──────────────────────────────────────
+  // Captures *why* this unit was chosen so the patient & driver UIs can render
+  // the genetic-algorithm reasoning. Includes every candidate (with coordinates)
+  // so the frontend can animate the GA candidate-scan over the map.
+  const winner = ambulances.find((a) => a.id === allocation.best_ambulance_id);
+  const backupIds = new Set(allocation.backup_suggestions.map((b) => b.ambulance_id));
+  const gaMetrics = {
+    engine: allocation.fallback ? ('heuristic' as const) : ('genetic_algorithm' as const),
+    fallback: allocation.fallback,
+    priority,
+    priority_confidence: Math.round((priorityConfidence ?? 0.5) * 100) / 100,
+    traffic_level: traffic.traffic_level,
+    congestion_multiplier: traffic.congestion_multiplier,
+    congestion_pct: traffic.congestion_pct,
+    hotspot_risk: Math.round(hotspot.risk_score * 100) / 100,
+    hotspot_category: hotspot.risk_category,
+    fitness_score: allocation.fitness_score,
+    distance_km: allocation.distance_km,
+    eta_minutes: etaMinutes,
+    reason: allocation.reason_for_assignment,
+    generations_run: allocation.generations_run ?? null,
+    population_size: allocation.population_size ?? null,
+    fleet_size: ambulances.length,
+    candidates_evaluated: ambulances.filter((a) => a.status === 'available').length,
+    backup_suggestions: allocation.backup_suggestions,
+    // Candidate roster with coordinates → drives the map GA-scan animation.
+    candidates: ambulances
+      .filter((a) => a.status === 'available')
+      .map((a) => ({
+        id: a.id,
+        vehicle_number: a.vehicle_number,
+        latitude: a.latitude,
+        longitude: a.longitude,
+        is_winner: a.id === allocation.best_ambulance_id,
+        is_backup: backupIds.has(a.id),
+        fitness:
+          allocation.backup_suggestions.find((b) => b.ambulance_id === a.id)?.fitness ??
+          (a.id === allocation.best_ambulance_id ? allocation.fitness_score : null),
+      })),
+    winner: winner
+      ? { id: winner.id, vehicle_number: winner.vehicle_number, latitude: winner.latitude, longitude: winner.longitude }
+      : null,
+    computed_at: new Date().toISOString(),
+  };
+
   // Step 5: Save assignment
   const { data: assignment, error } = await supabaseAdmin
     .from('assignments')
@@ -74,6 +119,18 @@ export const triggerAllocationService = async (
     .single();
 
   if (error) throw new AppError(error.message, 500);
+
+  // Persist GA metrics if the (optional) jsonb column exists. Wrapped so a
+  // missing column can never break dispatch — the live socket payload still
+  // carries the metrics regardless.
+  try {
+    await supabaseAdmin
+      .from('assignments')
+      .update({ ga_metrics: gaMetrics })
+      .eq('id', assignment.id);
+  } catch {
+    /* column not migrated yet — non-critical */
+  }
 
   // Step 6: Update request and ambulance status
   await updateEmergencyStatusService(request.id, 'assigned', priority);
@@ -101,10 +158,15 @@ export const triggerAllocationService = async (
     .eq('id', assignment.id)
     .single();
 
+  // Merge GA metrics onto the assignment object so every client receives them
+  // (driver cockpit, patient command center, admin) even without the DB column.
+  const assignmentWithGa = { ...(fullAssignment || assignment), ga_metrics: gaMetrics };
+
   const notifyPayload = {
-    assignment: fullAssignment || assignment,
+    assignment: assignmentWithGa,
     request: { ...request, priority },
     eta: etaMinutes,
+    ga_metrics: gaMetrics,
   };
 
   // Notify specific driver by user ID (if ambulance has a driver linked)
@@ -122,6 +184,7 @@ export const triggerAllocationService = async (
     priority,
     assignment_id: assignment.id,
     eta: etaMinutes,
+    ga_metrics: gaMetrics,
   });
 
   return assignment as Assignment;

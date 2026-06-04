@@ -109,10 +109,14 @@ CREATE TABLE IF NOT EXISTS assignments (
   status TEXT NOT NULL DEFAULT 'assigned' CHECK (
     status IN ('assigned','accepted','en_route','picked_up','completed','cancelled')
   ),
+  ga_metrics jsonb,
   assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   accepted_at TIMESTAMPTZ,
   completed_at TIMESTAMPTZ
 );
+
+-- Idempotent add for databases created before ga_metrics existed
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS ga_metrics jsonb;
 
 CREATE TABLE IF NOT EXISTS tracking_logs (
   id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),

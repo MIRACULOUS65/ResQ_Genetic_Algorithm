@@ -1,13 +1,24 @@
 import { Server, Socket } from 'socket.io';
 import { Server as HttpServer } from 'http';
 import { supabaseAdmin } from '../config/supabase';
+import { env } from '../config/env';
 
 let io: Server;
 
 export const initSocket = (httpServer: HttpServer): Server => {
   io = new Server(httpServer, {
     cors: {
-      origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+      origin: (origin, callback) => {
+        if (!origin || env.FRONTEND_URLS.includes(origin.replace(/\/$/, ''))) {
+          return callback(null, true);
+        }
+        try {
+          if (/\.vercel\.app$/.test(new URL(origin).hostname)) return callback(null, true);
+        } catch {
+          /* ignore malformed origin */
+        }
+        return callback(new Error(`Origin ${origin} not allowed by CORS`), false);
+      },
       methods: ['GET', 'POST'],
       credentials: true,
     },

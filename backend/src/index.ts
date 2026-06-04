@@ -21,9 +21,21 @@ const app = express();
 const httpServer = http.createServer(app);
 
 // ── Middleware ──────────────────────────────────────────────────────────────────
+// Allow the configured frontend origin(s). Supports a comma-separated list so a
+// Vercel production domain + preview deployments can all be permitted. Requests
+// with no Origin header (curl, server-to-server, health checks) are also allowed.
 app.use(
   cors({
-    origin: env.FRONTEND_URL,
+    origin: (origin, callback) => {
+      if (!origin || env.FRONTEND_URLS.includes(origin.replace(/\/$/, ''))) {
+        return callback(null, true);
+      }
+      // Allow any *.vercel.app preview deployment by default.
+      if (/\.vercel\.app$/.test(new URL(origin).hostname)) {
+        return callback(null, true);
+      }
+      return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   })

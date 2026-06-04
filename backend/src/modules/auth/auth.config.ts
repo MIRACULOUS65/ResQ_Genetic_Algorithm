@@ -36,7 +36,7 @@ try {
         },
       },
     },
-    trustedOrigins: [env.FRONTEND_URL],
+    trustedOrigins: env.FRONTEND_URLS,
   });
   console.log('✅ Better Auth initialized');
 } catch (err) {

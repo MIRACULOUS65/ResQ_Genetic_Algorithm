@@ -1,6 +1,16 @@
-# ResQ — AI Ambulance Allocation System
+<div align="center">
+ 
+## 🎥 SwyftPay Demo
 
-> Full-stack emergency dispatch platform powered by Machine Learning (priority, hotspot, and traffic prediction) and a custom Genetic Algorithm (optimal ambulance dispatch), with real-time map tracking. Built with Next.js, Express, Supabase, Socket.IO, and a Python FastAPI ML service. Deployable across any Indian city.
+[![SwyftPay Demo Video](./frontend/src/app/Logo.png)](https://youtu.be/_LySdgIsVUc)
+
+▶️ **[Watch Demo Video on Youtube](https://youtu.be/_LySdgIsVUc)**
+
+
+### **ResQ — AI Ambulance Allocation System**
+
+*Full-stack emergency dispatch platform powered by Machine Learning (priority, hotspot, and traffic prediction) and a custom Genetic Algorithm (optimal ambulance dispatch), with real-time map tracking. Built with Next.js, Express, Supabase, Socket.IO, and a Python FastAPI ML service. Deployable across any Indian city*
+
 
 **GitHub:** `https://github.com/MIRACULOUS65/Gen-Z`
 
